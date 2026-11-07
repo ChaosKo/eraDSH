@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Era 游戏桥接",
+    "description": "通过本地 eraDSH 桥接读取并操作受管的 Era 游戏实例。"
+  }
+}

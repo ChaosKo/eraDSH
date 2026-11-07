@@ -1,0 +1,14 @@
+# Local build and run state; never publish or commit these.
+/runtime/
+/artifacts/
+/bin/
+/obj/
+node_modules/
+
+# Machine-local configuration: it names this computer's game folder.
+/erabridge.config.json
+
+# Session credentials and captured evidence are written here by the bridge.
+*.log
+*.user
+*.suo

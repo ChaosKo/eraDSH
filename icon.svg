@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Era game bridge">
+  <rect x="4" y="10" width="56" height="44" rx="8" fill="#28405c"/>
+  <rect x="10" y="16" width="44" height="26" rx="4" fill="#0f1b28"/>
+  <path d="M16 22h14M16 27h10M16 32h12" stroke="#e8eef5" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="M43 24v10M38 29h10" stroke="#7fd4a8" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="20" cy="47" r="3" fill="#7fd4a8"/>
+  <circle cx="30" cy="47" r="3" fill="#e8eef5" opacity=".55"/>
+  <circle cx="40" cy="47" r="3" fill="#e8eef5" opacity=".55"/>
+</svg>

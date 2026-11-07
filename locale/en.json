@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Era game bridge",
+    "description": "Reads and controls a managed Era game instance through the local eraDSH bridge."
+  }
+}

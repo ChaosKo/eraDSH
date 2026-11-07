@@ -1,0 +1,4 @@
+- insert:
+    - id: dsh-era-bridge
+      name: dsh-era-bridge
+      config: {}
