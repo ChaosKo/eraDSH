@@ -274,3 +274,25 @@ bundle patch 从一行扩到两行：除 `dsh-era-bridge` 外，新增一条 `@d
 
 该预设挂载的工具集不含 web 搜索、子代理/workflow 与插件市场；`era_bridge` 属 Host 级注册，因此与预设选择无关。
 
+### 8.8 原地运行模式（2026-11-07 21:28–21:31）
+
+重资产游戏（含大量图片/音频）不应为了观察而整目录复制。新增 `runtimeMode`：
+
+| 方式 | 行为 | 原目录写入 |
+| --- | --- | --- |
+| `copy`（默认） | 镜像到 `runtime/instance`，引擎从副本加载 | 无 |
+| `inplace` | 不复制，引擎从游戏目录加载并以其为工作目录 | `Sav`/`Debug`/`Dat`/日志/配置 |
+
+验证在一份临时副本（22.1 MB）上完成，避免触碰真实存档：
+
+| 检查 | 结果 |
+| --- | --- |
+| inplace 构建 | `runtimeMode=inplace`，`enginePath` 指向游戏目录，宿主在 `runtime/host/`，未创建任何副本 |
+| inplace 会话 | open 读到 28 行、4 个按钮；act 成功且观察变化；close 正常，无残留进程 |
+| 宿主自述 | `status` 返回 `runtimeMode=inplace`、`gameDir=<游戏目录>` |
+| 原目录写入 | 副本中的 `Sav/global.sav` mtime 变化（GLOBAL 由游戏自己写）；`emuera.log`、`emuera.config` 未变 |
+| copy 回归 | 另一运行目录构建成功，`Sav/Debug/Dat` 为空、副本 22.1 MB、源目录存档未被写入 |
+| 宿主位置 | inplace 下游戏目录未新增任何桥接文件，宿主仍在仓库 `runtime/host/` |
+
+清理：临时副本与 `runtime/verify-copy` 已删除，真实游戏目录未被本项验证接触。
+

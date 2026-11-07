@@ -9,6 +9,10 @@
 #   engineExecutable  explicit parameter -> env ERADSH_ENGINE_EXE -> configuration
 #                     file -> auto-detected in gameRoot
 #   engineAssemblyVersion, runtimeDirectory   same ladder, both optional
+#   runtimeMode       explicit parameter -> env ERADSH_RUNTIME_MODE -> configuration
+#                     file -> copy. `copy` mirrors the game folder into the runtime
+#                     directory; `inplace` runs the engine from the game folder and
+#                     copies nothing, so the game writes its own saves there.
 #
 # The common case therefore needs no configuration at all: open a shell (or a
 # DSH workspace) in the game folder and run the build. A configuration file is
@@ -133,6 +137,7 @@ function Get-EraDshSettings {
   [string]$EngineExecutable,
   [string]$EngineAssemblyVersion,
   [string]$RuntimeDirectory,
+  [string]$RuntimeMode,
   [string]$ConfigPath
  )
  $repositoryRoot = $script:EraDshRepositoryRoot
@@ -208,16 +213,31 @@ function Get-EraDshSettings {
  }
  $engineName = [IO.Path]::GetFileName($enginePath)
 
+ # ---- runtime mode ----
+ # copy    : the game folder is mirrored into <runtime>, and the bridge writes only there.
+ # inplace : no mirror; the engine runs from the game folder itself, so the game writes
+ #           its own Sav/Debug/Dat and logs into the original directory.
+ $runtimeModeValue = $null
+ if (Test-EraDshValue $RuntimeMode) { $runtimeModeValue = $RuntimeMode }
+ elseif (Test-EraDshValue $env:ERADSH_RUNTIME_MODE) { $runtimeModeValue = $env:ERADSH_RUNTIME_MODE }
+ elseif (Test-EraDshValue $file['runtimeMode']) { $runtimeModeValue = $file['runtimeMode'] }
+ else { $runtimeModeValue = 'copy' }
+ $runtimeModeValue = $runtimeModeValue.Trim().ToLowerInvariant()
+ if ($runtimeModeValue -ne 'copy' -and $runtimeModeValue -ne 'inplace') {
+  throw ('runtimeMode must be copy or inplace, not ' + $runtimeModeValue)
+ }
+
  # ---- isolated runtime ----
  $runtimeValue = $null
  if (Test-EraDshValue $RuntimeDirectory) { $runtimeValue = $RuntimeDirectory }
  elseif (Test-EraDshValue $env:ERADSH_RUNTIME_DIR) { $runtimeValue = $env:ERADSH_RUNTIME_DIR }
  elseif (Test-EraDshValue $file['runtimeDirectory']) { $runtimeValue = $file['runtimeDirectory'] }
+ elseif ($runtimeModeValue -eq 'inplace') { $runtimeValue = Join-Path 'runtime' 'host' }
  else { $runtimeValue = Join-Path 'runtime' 'instance' }
  $runtimePath = Resolve-EraDshPath -Path $runtimeValue -BaseDirectory $repositoryRoot
 
  if (Test-EraDshSamePath -Left $runtimePath -Right $gameRootPath) {
-  throw 'runtimeDirectory must not be the game folder itself; the bridge needs an isolated copy.'
+  throw 'runtimeDirectory must not be the game folder itself; the bridge needs its own directory.'
  }
  if (Test-EraDshSamePath -Left $runtimePath -Right $repositoryRoot) {
   throw 'runtimeDirectory must be a subdirectory, not the repository root.'
@@ -235,6 +255,7 @@ function Get-EraDshSettings {
   EngineSource = $engineSource
   EngineAssemblyVersion = $engineVersion
   EngineVerified = $engineVerified
+  RuntimeMode = $runtimeModeValue
   RuntimeDirectory = $runtimeValue
   RuntimePath = $runtimePath
  }

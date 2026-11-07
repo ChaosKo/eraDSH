@@ -29,7 +29,7 @@ namespace EraDSH {
   static Assembly Engine;
   static volatile Form Window;
   static volatile bool Exited;
-  static string Failure,SessionId,RuntimeDir,ArtifactDir;
+  static string Failure,SessionId,RuntimeDir,GameDir,ArtifactDir;
   static object ConsoleObject;
   static Thread Server;
   static int ImageNumber;
@@ -61,10 +61,22 @@ namespace EraDSH {
     RuntimeDir=NormalDir(S(Settings,"runtimeDirectory"));ArtifactDir=Path.GetFullPath(S(Settings,"artifactDirectory"));
     SessionId=S(Settings,"sessionId");Directory.CreateDirectory(ArtifactDir);
     string enginePath=Path.GetFullPath(S(Settings,"enginePath"));
-    if(!enginePath.StartsWith(RuntimeDir,StringComparison.OrdinalIgnoreCase))throw new InvalidOperationException("Engine must be inside isolated runtime");
+    // copy mode: the engine is a mirror inside the runtime directory and the host must
+    // run from that same directory. inplace mode: the engine is the game's own file,
+    // the host keeps its executable elsewhere, and the game folder is the working
+    // directory so the engine resolves its own assets, saves and logs there.
+    bool inplace=S(Settings,"runtimeMode","copy")=="inplace";
+    if(inplace) {
+     GameDir=NormalDir(S(Settings,"gameRoot"));
+     if(!Directory.Exists(GameDir))throw new InvalidOperationException("Game folder is missing: "+GameDir);
+     if(!enginePath.StartsWith(GameDir,StringComparison.OrdinalIgnoreCase))throw new InvalidOperationException("Inplace engine must be inside the game folder");
+    } else {
+     if(!enginePath.StartsWith(RuntimeDir,StringComparison.OrdinalIgnoreCase))throw new InvalidOperationException("Engine must be inside isolated runtime");
+     if(NormalDir(AppDomain.CurrentDomain.BaseDirectory)!=RuntimeDir)throw new InvalidOperationException("Host must run from isolated runtime");
+     GameDir=RuntimeDir;
+    }
     if(FileHash(enginePath)!=S(Settings,"engineSha256").ToLowerInvariant())throw new InvalidOperationException("Engine SHA256 mismatch");
-    if(NormalDir(AppDomain.CurrentDomain.BaseDirectory)!=RuntimeDir)throw new InvalidOperationException("Host must run from isolated runtime");
-    Directory.SetCurrentDirectory(RuntimeDir);SetProcessDPIAware();
+    Directory.SetCurrentDirectory(GameDir);SetProcessDPIAware();
     Engine=Assembly.LoadFrom(enginePath);
     // The adapter depends on engine members that are not part of a stable contract,
     // so the accepted identity comes from the session settings instead of a constant.
@@ -76,8 +88,8 @@ namespace EraDSH {
     var sys=Engine.GetType("MinorShift._Library.Sys",true);
     var exeDir=sys.GetField("ExeDir",Members);var exeName=sys.GetField("ExeName",Members);
     if(exeDir==null||exeName==null)throw new MissingFieldException("Sys path contract unavailable");
-    exeDir.SetValue(null,RuntimeDir);exeName.SetValue(null,Path.GetFileName(enginePath));
-    Record("startup",Map("sessionId",SessionId,"engineAssembly",Engine.FullName,"engineSha256",FileHash(enginePath),"runtimeDirectory",RuntimeDir,"processId",System.Diagnostics.Process.GetCurrentProcess().Id));
+    exeDir.SetValue(null,GameDir);exeName.SetValue(null,Path.GetFileName(enginePath));
+    Record("startup",Map("sessionId",SessionId,"engineAssembly",Engine.FullName,"engineSha256",FileHash(enginePath),"runtimeMode",S(Settings,"runtimeMode","copy"),"gameDir",GameDir,"runtimeDirectory",RuntimeDir,"processId",System.Diagnostics.Process.GetCurrentProcess().Id));
     Application.Idle+=OnIdle;
     Server=new Thread(Serve);Server.IsBackground=true;Server.Name="eraDSH local IPC";Server.Start();
     Engine.EntryPoint.Invoke(null,new object[]{new string[0]});
@@ -95,7 +107,7 @@ namespace EraDSH {
     if(Failure!=null){Ready.Set();f.Close();return;}
     object c=Field(f,"console");if(c==null)continue;
     string actual=Convert.ToString(Engine.GetType("MinorShift.Emuera.Program").GetProperty("ExeDir",Members).GetValue(null,null));
-    if(NormalDir(actual)!=RuntimeDir) { Failure="Runtime directory isolation mismatch";Ready.Set();f.Close();return; }
+    if(NormalDir(actual)!=GameDir) { Failure="Runtime directory isolation mismatch";Ready.Set();f.Close();return; }
     ConsoleObject=c;Window=f;Ready.Set();Record("ready",Map("title",f.Text,"runtimeDirectory",actual));return;
    }
   }
@@ -162,7 +174,7 @@ namespace EraDSH {
   }
   static object Dispatch(Dictionary<string,object> request) {
    string action=S(request,"action");
-   if(action=="status")return Map("ok",true,"sessionId",SessionId,"ready",Window!=null,"exited",Exited,"failure",Failure,"engineAssembly",Engine.FullName,"runtimeDirectory",RuntimeDir,"processId",System.Diagnostics.Process.GetCurrentProcess().Id);
+   if(action=="status")return Map("ok",true,"sessionId",SessionId,"ready",Window!=null,"exited",Exited,"failure",Failure,"engineAssembly",Engine.FullName,"runtimeMode",S(Settings,"runtimeMode","copy"),"gameDir",GameDir,"runtimeDirectory",RuntimeDir,"processId",System.Diagnostics.Process.GetCurrentProcess().Id);
    if(action=="close")return Map("ok",true,"status","normal_close_scheduled");
    if(action=="observe")return OnUI(delegate{return Snapshot(request);});
    if(action!="act")return Error("UNKNOWN_ACTION","Use status, observe, act, or close");
