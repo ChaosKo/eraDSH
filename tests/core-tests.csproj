@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <StartupObject>CoreTests.Program</StartupObject>
+    <OutputPath>bin/core-tests/</OutputPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="core-tests.cs" />
+    <Compile Include="../bridge/net8/EraBridgeHook/StartupHook.cs" Link="StartupHook.cs" />
+  </ItemGroup>
+</Project>

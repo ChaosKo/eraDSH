@@ -47,14 +47,21 @@ $sourceHash=(Get-FileHash -LiteralPath $sourceEngine -Algorithm SHA256).Hash.ToL
 if($settings.EngineKind -eq 'core') {
  $hookProject=Join-Path $repositoryRoot 'bridge\net8\EraBridgeHook'
  $hookPath=Join-Path $hookProject 'bin\Release\net8.0-windows\EraBridgeHook.dll'
- if(-not(Test-Path -LiteralPath $hookPath -PathType Leaf)) {
+ if(@(Get-CimInstance Win32_Process | Where-Object {$_.ExecutablePath -eq $sourceEngine}).Count) {
+  throw ('The engine is already running from ' + $sourceEngine + '; close it before rebuilding')
+ }
+ $hookStampPath=Join-Path $hookProject 'bin\Release\net8.0-windows\bridge-source.sha256'
+ $hookSourceStamp=((Get-FileHash -LiteralPath (Join-Path $hookProject 'StartupHook.cs') -Algorithm SHA256).Hash+':'+(Get-FileHash -LiteralPath (Join-Path $hookProject 'EraBridgeHook.csproj') -Algorithm SHA256).Hash)
+ $previousStamp=if(Test-Path -LiteralPath $hookStampPath){[IO.File]::ReadAllText($hookStampPath)}else{''}
+ if(-not(Test-Path -LiteralPath $hookPath -PathType Leaf) -or $previousStamp -ne $hookSourceStamp) {
   $dotnet=Get-Command dotnet -ErrorAction SilentlyContinue
   if(-not $dotnet) {
    throw ('This engine is a bundled .NET build and needs the .NET SDK once to build its adapter. Install the .NET SDK, or build ' + $hookProject + ' elsewhere and place EraBridgeHook.dll at ' + $hookPath)
   }
-  Write-Output 'building the .NET 8 startup-hook adapter (first use only)'
+  Write-Output 'building the .NET 8 startup-hook adapter (first use or source changed)'
   & dotnet build $hookProject -c Release --nologo -v q | Out-Host
   if($LASTEXITCODE -ne 0 -or -not(Test-Path -LiteralPath $hookPath -PathType Leaf)) { throw 'Failed to build the .NET 8 startup-hook adapter' }
+  [IO.File]::WriteAllText($hookStampPath,$hookSourceStamp)
  }
  if(@(Get-CimInstance Win32_Process | Where-Object {$_.ExecutablePath -eq $sourceEngine}).Count) {
   throw ('The engine is already running from ' + $sourceEngine + '; close it before rebuilding')

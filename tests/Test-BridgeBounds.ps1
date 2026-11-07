@@ -11,7 +11,8 @@ using System.Collections;
 using System.Text;
 namespace EraBounds {
  public class Input {
-  public string InputType="IntValue";public long ID=1;public bool OneInput=false;
+  public string InputType="StrValue";public long ID=1;public bool OneInput=false;
+   public bool NeedValue {get{return true;}}
   public long Timelimit=-1;public bool IsSystemInput=false;
  }
  public class Button {
@@ -26,7 +27,8 @@ namespace EraBounds {
   public override string ToString(){return Text;}
  }
  public class Console {
-  public string state="WaitInput";public Input inputReq=new Input();public ArrayList displayLineList=new ArrayList();public int newButtonGeneration=1;
+  public string state="WaitInput";public Input inputReq=new Input();public ArrayList displayLineList=new ArrayList();public int newButtonGeneration=1,lastButtonGeneration=1;
+   public bool IsRunningTimer {get{return false;}}
   public Console(){var buttons=new Button[200];for(int i=0;i<buttons.Length;i++)buttons[i]=new Button();displayLineList.Add(new Line(0,new string('x',60000),new Button[0]));displayLineList.Add(new Line(1,"short",buttons));}
   public void GetDisplayStrings(StringBuilder b){foreach(Line line in displayLineList)b.AppendLine(line.Text);}
  }
@@ -48,7 +50,7 @@ function Invoke-Private([string]$Name,[object[]]$Arguments) {
  return $hostType.GetMethod($Name,$flags).Invoke($null,$raw)
 }
 function Observe([int]$Start=0,[int]$Limit=80) {
- $q=New-Object 'System.Collections.Generic.Dictionary[string,object]';$q['mode']='text';$q['fromLine']=$Start;$q['limitLines']=$Limit
+ $q=New-Object 'System.Collections.Generic.Dictionary[string,object]';$q['mode']='text';$q['noise']='raw';$q['fromLine']=$Start;$q['limitLines']=$Limit
  $items=New-Object 'object[]' 1;$items[0]=$q
  return (Invoke-Private 'Snapshot' $items)
 }
@@ -64,10 +66,10 @@ try {
  $console.displayLineList[1].Buttons[0].Inputs='changed-hidden-button-value'
  $changed=Observe
  Assert-Test 'revision_covers_hidden_button_metadata' ($changed['observationId'] -cne $obs['observationId'])
- $console.newButtonGeneration=2
+ $console.lastButtonGeneration=2
  $inactive=Observe
  Assert-Test 'inactive_buttons_excluded' ($inactive['buttons'].Count -eq 0 -and $inactive['omittedInactiveButtons'] -eq 200)
- $console.newButtonGeneration=1
+ $console.lastButtonGeneration=1
  $argsList=New-Object 'object[]' 1;$argsList[0]=@{large=('z'*(5*1024*1024))}
  $fallback=(Invoke-Private 'SerializeResponse' $argsList) | ConvertFrom-Json
  Assert-Test 'oversize_response_fallback' (-not $fallback.ok -and $fallback.code -eq 'RESPONSE_LIMIT')

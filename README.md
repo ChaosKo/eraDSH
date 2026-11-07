@@ -54,7 +54,7 @@ dsh plugin --profile web add github:ChaosKo/eraDSH
 dsh plugin --profile web add C:\path\to\eraDSH
 ```
 
-链接安装后改代码即时生效；`index.js` 之类的 Host 代码改动需要重启一次 `dsh web`。改动 `bridge/net8/EraBridgeHook` 后必须重装一次（或让构建重新编译），因为注入用的 DLL 是构建产物。
+链接安装后的脚本改动会被下一次调用读取；[工具入口](<index.js>) 之类的 Host 模块需要重新加载（替换已安装模块时通常需重启 `dsh web`，以安装结果为准）。修改 [Core 钩子源码](<bridge/net8/EraBridgeHook/StartupHook.cs>) 后，下一次 build 会校验源码标记并自动重新编译；不要复用已经启动且加载旧 DLL 的游戏实例。Era 预设的新修订应在新会话验证，旧会话不自动切换。
 
 ### 不用插件
 
@@ -66,10 +66,10 @@ dsh plugin --profile web add C:\path\to\eraDSH
 
 ```text
 era_bridge({ action: "build", gameRoot: "D:/Games/SomeEraGame" })
-era_bridge({ action: "open" })                 # 只启动，立刻返回
-era_bridge({ action: "observe" })              # 采样：pending 还在就再调一次
-era_bridge({ action: "observe" })              # 看当前画面与按钮
-era_bridge({ action: "act", kind: "choose", choiceId: "<按钮 id>", observationId: "<最新 observationId>" })
+era_bridge({ action: "open" })                 # 只返回启动回执，不等 IPC 或首屏
+era_bridge({ action: "observe" })              # pending=true 时继续有界观测
+era_bridge({ action: "observe" })              # 等 canAct=true，再看正文与按钮
+era_bridge({ action: "act", kind: "choose", choiceId: "<按钮 id>", observationId: "<可操作观察的 observationId>" })
 era_bridge({ action: "advance", maxSteps: 20 })   # 剧情连按回车，遇到决策就停
 era_bridge({ action: "close" })
 ```
@@ -80,6 +80,8 @@ era_bridge({ action: "close" })
 era_bridge({ action: "observe", sinceObservationId: "<上次的 observationId>" })  # 只要差异
 era_bridge({ action: "observe", sinceCursor: 120 })                             # 从第 120 行往后读
 ```
+
+`ok=true` 或 `attached=true` 不代表可输入；请等 `canAct=true`。普通重绘不使决策凭证失效，但已消费或已换代的输入请求会被拒绝。超时结果不明确时，不要换 actionId 盲重送。详见 [0.3.1 桥接协议](<docs/bridge-protocol.md>)。
 
 ## 配置
 

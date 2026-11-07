@@ -31,21 +31,22 @@
 
                 # 工具：era_bridge
 
-                六个动作，一次调用只做一件事：
+                七个动作，一次调用只做一件事：
                 - build：为某个游戏目录准备一局会话，返回 sessionFile。构建脚本随插件分发，不需要也不能去找仓库。
-                - open：只负责启动实例，立刻返回 launched=true / pending=true，**不等画面**；之后用 observe 采样。同一会话不要重复 open。
-                - status：确认实例是否还活着；长时间停顿后先 status 再 act。
-                - observe：读取当前状态。mode=text 取正文与按钮，visual 取截图，both 两者都要，auto 目前等同 both。返回里 pending=true 表示引擎还没到可操作的画面，稍等再 observe 一次；连续两次 pending 就停下来问用户。
-                - act：提交一次输入。kind=choose 按按钮并给 choiceId；kind=input 提交 value；kind=continue 回应 EnterKey 或 AnyKey 等待。
+                - open：只返回启动回执 launched=true / pending=true，不等 IPC 或画面。同一会话不要重复 open。
+                - status：确认实例是否还活着；状态回执不授权输入，之后仍需 observe。
+                - observe：读取正文、真实按钮和输入状态。mode=text 取正文，visual 取截图，both 两者都要，auto 等同 both。只有 canAct=true 才可提交动作；pending=true 表示仍在加载或忙碌，可以继续有界观测。两次 pending 不是失败，不要因此重启或立即询问用户；接近约定时间预算、出现明确失败或长期无进展时报告诊断。
+                - act：提交一次输入。kind=choose 按按钮并给 choiceId；kind=input 提交 value；kind=continue 回应可操作的 EnterKey 或 AnyKey 等待。
+                - advance：连续推进无计时的普通叙述，遇到决策、计时等待、忙碌状态或截止时间就停；不要用来跳过加载动画。
                 - close：正常关闭实例。自主游玩过程中不要调用，结束时用它收尾。
 
                 开始一局之前先建会话：调用 era_bridge 的 build 动作，传游戏目录的绝对路径，例如 action="build"、gameRoot="D:/Games/SomeEraGame"。脚本随插件安装，**不要在工作区里找 eraDSH 仓库，也不要自己拼脚本路径**；不知道游戏目录就问用户。建好之后其余动作可以省略 sessionFile，工具会记住最近一次构建的会话；游戏目录不能是插件仓库本身，脚本会拒绝。
 
                 观察与动作规则：
-                - act 必须带最近一次观察的 observationId。旧 ID 会被 STALE_OBSERVATION 拒绝，重新 observe 即可，不要拿旧 ID 硬试。
-                - 同一个 actionId 只认一次。结果不明时先 observe 看状态，不要换 ID 重发。
-                - 只按 active 的按钮。历史按钮会被过滤成 omittedInactiveButtons，凭记忆按键值会按到别的东西。
-                - 分清拒绝码：STALE_OBSERVATION 画面已变、DUPLICATE_ACTION 这个动作做过、WRONG_INPUT_KIND 当前不是这种输入、INVALID_INPUT 值本身不合法。
+                - act 带可操作观察的 observationId；inputEpoch 标识真实输入请求，普通重绘不使其失效。STALE_OBSERVATION 表示凭证未知、已消耗或请求已换代，应重新 observe，不要硬试。
+                - 同一个 actionId 只认一次。结果不明时先 observe 看状态，不要换 ID 重发；已开始执行的超时可能返回 OUTCOME_UNCERTAIN，不能当成未输入。
+                - 只按 active 且 choosable 的按钮。历史按钮会被过滤成 omittedInactiveButtons，凭记忆按键值会按到别的东西。
+                - 分清拒绝码：NOT_READY/NOT_WAITING_INPUT 当前不可输入、STALE_OBSERVATION 输入代次已变、DUPLICATE_ACTION 已记录该动作、WRONG_INPUT_KIND 输入类型不符、INVALID_INPUT 值不合法。
                 - 正文来自引擎缓冲，可能夹带 img、shape 一类标签；截图是本机 PNG 路径，要看画面必须另外用图像工具打开，不能因为 observe 成功就说画面没问题。
                 - fromLine 与 limitLines 只是分页读取，不改变游戏状态。
 

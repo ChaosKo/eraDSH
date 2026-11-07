@@ -33,6 +33,21 @@ namespace EraDSH {
   static object ConsoleObject;
   static Thread Server;
   static int ImageNumber;
+  // UI-thread-owned input identity. Presentation changes never authorize or revoke input.
+  static object EpochOwner,EpochRequest,SubmittedOwner,SubmittedRequest;
+  static string EpochSemantic,EpochState,CurrentInputEpoch,SubmittedSemantic;
+  static long EpochNumber;
+  static bool AwaitingTransition,EpochRefreshEligible;
+  static object EpochRefreshSource;
+  static string EpochRefreshSemantic;
+  sealed class Delivered { public string Epoch;public readonly Dictionary<string,string> Choices=new Dictionary<string,string>(); }
+  static readonly Dictionary<string,Delivered> DeliveredObservations=new Dictionary<string,Delivered>();
+  static readonly Queue<string> DeliveredOrder=new Queue<string>();
+  sealed class Control {
+   public object Request;public string State,Epoch,Semantic;public long Generation,NextGeneration;
+   public bool CanAct,Timed,SystemInput;public IList Lines;
+   public Dictionary<string,object> Input;public readonly List<Dictionary<string,object>> Buttons=new List<Dictionary<string,object>>();
+  }
   static JavaScriptSerializer Json() { return new JavaScriptSerializer { MaxJsonLength=4*1024*1024,RecursionLimit=50 }; }
   static Dictionary<string,object> Map(params object[] pairs) { var d=new Dictionary<string,object>(); for(int i=0;i<pairs.Length;i+=2)d[(string)pairs[i]]=pairs[i+1];return d; }
   static string S(Dictionary<string,object>d,string key,string fallback="") { object v; return d.TryGetValue(key,out v)&&v!=null?Convert.ToString(v,CultureInfo.InvariantCulture):fallback; }
@@ -45,6 +60,96 @@ namespace EraDSH {
   static string NormalDir(string p) { return Path.GetFullPath(p).TrimEnd(Path.DirectorySeparatorChar)+Path.DirectorySeparatorChar; }
   static void Record(string kind,object value) { lock(Gate)File.AppendAllText(Path.Combine(ArtifactDir,"host-audit.jsonl"),Json().Serialize(Map("utc",DateTime.UtcNow.ToString("o"),"kind",kind,"value",value))+"\n",Utf8); }
   static object Error(string code,string message) { return Map("ok",false,"code",code,"message",Clip(message,2048)); }
+  // Supported Framework builds expose some of these as properties and others as fields.
+  static object Member(object o,string name) {
+   if(o==null)throw new MissingMemberException("Null owner for "+name);
+   var t=o.GetType();var f=t.GetField(name,Members);if(f!=null)return f.GetValue(o);
+   var p=t.GetProperty(name,Members);if(p!=null&&p.GetIndexParameters().Length==0)return p.GetValue(o,null);
+   throw new MissingMemberException(t.FullName,name);
+  }
+  static bool ValueKind(string kind) { return kind=="IntValue"||kind=="StrValue"||kind=="IntButton"||kind=="StrButton"||kind=="AnyValue"; }
+  static bool IntegerKind(string kind) { return kind=="IntValue"||kind=="IntButton"; }
+  static bool KeyKind(string kind) { return kind=="EnterKey"||kind=="AnyKey"; }
+  static int Budget(Dictionary<string,object> request,int fallback,int maximum) { return Math.Max(1,Math.Min(maximum,I(request,"timeoutMs",fallback))); }
+  static Dictionary<string,object> Lifecycle(Control c) {
+   bool attached=Window!=null&&!Window.IsDisposed&&ConsoleObject!=null;
+   string phase=Exited?"exited":Failure!=null?"failed":!attached?"starting":c==null?"loading":c.CanAct?"waiting-input":c.State=="Initializing"||c.State=="Init"?"loading":c.State=="Error"?"failed":c.State=="Quit"?"exited":"running";
+   bool can=attached&&c!=null&&c.CanAct&&phase=="waiting-input";
+   return Map("attached",attached,"phase",phase,"pending",!can&&phase!="failed"&&phase!="exited","canAct",can,"ready",can,"inputEpoch",c==null?null:c.Epoch);
+  }
+  static void AddLifecycle(Dictionary<string,object> result,Control c) { foreach(var pair in Lifecycle(c))result[pair.Key]=pair.Value; }
+  static Dictionary<string,object> Pending(string reason) {
+   var result=Map("ok",true,"sessionId",SessionId,"state",Exited?"Exited":"Initializing","reason",reason);
+   AddLifecycle(result,null);return result;
+  }
+  static Dictionary<string,object> ContractError(Exception ex) {
+   var result=Map("ok",false,"code","ADAPTER_CONTRACT_MISSING","message",Clip(Root(ex).Message,2048));
+   AddLifecycle(result,null);result["phase"]="failed";result["pending"]=false;return result;
+  }
+  static Control ReadControl() {
+   var c=new Control();c.State=Convert.ToString(Member(ConsoleObject,"state"));c.Request=Member(ConsoleObject,"inputReq");
+   c.Lines=Member(ConsoleObject,"displayLineList") as IList;if(c.Lines==null)throw new MissingMemberException("displayLineList is not IList");
+   c.Generation=Convert.ToInt64(Member(ConsoleObject,"lastButtonGeneration"),CultureInfo.InvariantCulture);
+   c.NextGeneration=Convert.ToInt64(Member(ConsoleObject,"newButtonGeneration"),CultureInfo.InvariantCulture);
+   string kind=c.Request==null?"Void":Convert.ToString(Member(c.Request,"InputType"));
+   bool needValue=c.Request!=null&&Convert.ToBoolean(Member(c.Request,"NeedValue"),CultureInfo.InvariantCulture);
+   c.SystemInput=c.Request!=null&&Convert.ToBoolean(Member(c.Request,"IsSystemInput"),CultureInfo.InvariantCulture);
+   long limit=c.Request==null?0:Convert.ToInt64(Member(c.Request,"Timelimit"),CultureInfo.InvariantCulture);
+   bool runningTimer=Convert.ToBoolean(Member(ConsoleObject,"IsRunningTimer"),CultureInfo.InvariantCulture);
+   c.Timed=limit>0||runningTimer;
+   c.Input=Map("kind",kind,"requestId",c.Request==null?"":Convert.ToString(Member(c.Request,"ID"),CultureInfo.InvariantCulture),"oneInput",c.Request!=null&&Convert.ToBoolean(Member(c.Request,"OneInput"),CultureInfo.InvariantCulture),"needValue",needValue,"timeLimit",limit,"systemInput",c.SystemInput,"runningTimer",runningTimer,"timed",c.Timed,"supported",ValueKind(kind)||KeyKind(kind));
+   var keys=new SortedSet<string>(StringComparer.Ordinal);
+   for(int n=0;n<c.Lines.Count;n++) {
+    object line=c.Lines[n];var items=Member(line,"Buttons") as Array;if(items==null)throw new MissingMemberException("Buttons is not an array");
+    for(int j=0;j<items.Length;j++) {
+     object b=items.GetValue(j);if(b==null||!Convert.ToBoolean(Member(b,"IsButton"),CultureInfo.InvariantCulture))continue;
+     bool integer=Convert.ToBoolean(Member(b,"IsInteger"),CultureInfo.InvariantCulture);long generation=Convert.ToInt64(Member(b,"Generation"),CultureInfo.InvariantCulture);
+     string value=Convert.ToString(Member(b,integer?"Input":"Inputs"),CultureInfo.InvariantCulture)??"";
+     // 1.821 and 1.824 MoveMouse both compare Generation with lastButtonGeneration.
+     bool active=c.State=="WaitInput"&&needValue&&generation==c.Generation&&(!IntegerKind(kind)||integer);
+     string key=Json().Serialize(new object[]{generation,integer,value});if(active)keys.Add(key);
+     string id="b-"+Convert.ToString(Member(line,"LineNo"),CultureInfo.InvariantCulture)+"-"+j+"-"+generation;
+     c.Buttons.Add(Map("id",id,"label",Clip(b.ToString(),512),"labelTruncated",b.ToString().Length>512,"value",value.Length>2048?null:value,"valueTooLong",value.Length>2048,"choosable",value.Length<=2048,"active",active,"integer",integer,"generation",generation.ToString(CultureInfo.InvariantCulture),"lineIndex",n,"key",key));
+    }
+   }
+   c.Semantic=Hash(Json().Serialize(new object[]{c.Input,c.Generation,c.NextGeneration,new List<string>(keys)}));
+   if(AwaitingTransition&&(!object.ReferenceEquals(SubmittedOwner,ConsoleObject)||!object.ReferenceEquals(SubmittedRequest,c.Request)||SubmittedSemantic!=c.Semantic||c.State!="WaitInput"))AwaitingTransition=false;
+   object refreshSource=null;string refreshSemantic=null;bool refresh=false;
+   // MeiQ ANIMATION_ANYKEY loops TINPUT[S] 50 with -999 (or |) until user input.
+   // Only this unconsumed sentinel loop may renew request IDs/objects without a new decision.
+   if(!AwaitingTransition&&c.State=="WaitInput"&&!c.SystemInput&&runningTimer&&limit==50&&(kind=="IntValue"||kind=="StrValue"))try {
+    bool hasDefault=Convert.ToBoolean(Member(c.Request,"HasDefValue"),CultureInfo.InvariantCulture);
+    string sentinel=Convert.ToString(Member(c.Request,kind=="IntValue"?"DefIntValue":"DefStrValue"),CultureInfo.InvariantCulture);
+    if(hasDefault&&(sentinel=="-999"||kind=="StrValue"&&sentinel=="|")) {
+     refreshSource=Member(Member(ConsoleObject,"emuera"),"getCurrentLine");
+     if(refreshSource!=null) {
+      var plainRows=new List<string>();foreach(object line in c.Lines)plainRows.Add(line.ToString());
+      var semantics=new Dictionary<string,object>(c.Input);semantics.Remove("requestId");
+      refreshSemantic=Hash(Json().Serialize(new object[]{semantics,c.Generation,c.NextGeneration,new List<string>(keys),plainRows}));refresh=true;
+     }
+    }
+   } catch(MissingMemberException) { /* Unknown variants retain strict request identity. */ }
+   bool continuous=refresh&&EpochRefreshEligible&&object.ReferenceEquals(EpochOwner,ConsoleObject)&&EpochState=="WaitInput"&&object.ReferenceEquals(EpochRefreshSource,refreshSource)&&EpochRefreshSemantic==refreshSemantic;
+   bool sourceChanged=(refresh||EpochRefreshEligible)&&(refresh!=EpochRefreshEligible||!object.ReferenceEquals(EpochRefreshSource,refreshSource)||EpochRefreshSemantic!=refreshSemantic);
+   if(!continuous&&(!object.ReferenceEquals(EpochOwner,ConsoleObject)||!object.ReferenceEquals(EpochRequest,c.Request)||EpochSemantic!=c.Semantic||EpochState!=c.State||sourceChanged))
+    CurrentInputEpoch=SessionId+":input:"+(++EpochNumber).ToString(CultureInfo.InvariantCulture);
+   EpochOwner=ConsoleObject;EpochRequest=c.Request;EpochSemantic=c.Semantic;EpochState=c.State;
+   EpochRefreshEligible=refresh;EpochRefreshSource=refreshSource;EpochRefreshSemantic=refreshSemantic;
+   c.Epoch=CurrentInputEpoch;
+   c.CanAct=!Exited&&Failure==null&&c.State=="WaitInput"&&c.Request!=null&&(ValueKind(kind)&&needValue||KeyKind(kind)&&!needValue&&!c.Timed&&!c.SystemInput)&&!AwaitingTransition;
+   if(ValueKind(kind)&&c.Timed&&!runningTimer)c.CanAct=false; // expired timer must not accept a late decision
+   return c;
+  }
+  static void ConsumeInput(Control c) {
+   SubmittedOwner=ConsoleObject;SubmittedRequest=c.Request;SubmittedSemantic=c.Semantic;AwaitingTransition=true;
+   EpochRefreshEligible=false;EpochRefreshSource=null;EpochRefreshSemantic=null;
+   CurrentInputEpoch=SessionId+":input:"+(++EpochNumber).ToString(CultureInfo.InvariantCulture);
+  }
+  static void RememberDelivered(Dictionary<string,object> result,Control c) {
+   if(!c.CanAct)return;string id=S(result,"observationId");var d=new Delivered { Epoch=c.Epoch };
+   foreach(var b in (List<object>)result["buttons"]) { var shown=(Dictionary<string,object>)b;foreach(var live in c.Buttons)if(S(live,"id")==S(shown,"id")&&(bool)live["active"])d.Choices[S(shown,"id")]=S(live,"key"); }
+   lock(Gate) { if(!DeliveredObservations.ContainsKey(id))DeliveredOrder.Enqueue(id);DeliveredObservations[id]=d;while(DeliveredOrder.Count>128)DeliveredObservations.Remove(DeliveredOrder.Dequeue()); }
+  }
 
   [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr h,IntPtr dc,uint flags);
@@ -112,17 +217,30 @@ namespace EraDSH {
    }
   }
   sealed class Work { public int State;public readonly TaskCompletionSource<object> Completion=new TaskCompletionSource<object>(); }
-  static object OnUI(Func<object> op) {
-   if(!Ready.WaitOne(12000)||Window==null||Window.IsDisposed)return Error("NOT_READY",Failure??"Engine has no ready window");
+  static object OnUI(Func<object> op,int timeoutMs=1500) {
+   if(!Ready.WaitOne(0)||Window==null||Window.IsDisposed||ConsoleObject==null)return Error("NOT_READY",Failure??"Engine has no attached window");
    var work=new Work();
-   Window.BeginInvoke((Action)delegate {
+   try { Window.BeginInvoke((Action)delegate {
     if(Interlocked.CompareExchange(ref work.State,1,0)!=0)return;
-    try { work.Completion.SetResult(op()); }catch(Exception ex){work.Completion.SetResult(Error("ENGINE_ERROR",Root(ex).Message));}
+    try { work.Completion.SetResult(op()); }
+    catch(Exception ex) { var root=Root(ex);work.Completion.SetResult(root is MissingMemberException?ContractError(root):Error("ENGINE_ERROR",root.Message)); }
     finally { Interlocked.Exchange(ref work.State,2); }
-   });
-   if(work.Completion.Task.Wait(15000))return work.Completion.Task.Result;
+   }); } catch(InvalidOperationException) { return Error("NOT_READY","Engine window is unavailable"); }
+   if(work.Completion.Task.Wait(Math.Max(1,Math.Min(timeoutMs,5000))))return work.Completion.Task.Result;
    bool cancelled=Interlocked.CompareExchange(ref work.State,3,0)==0;
-   return Error(cancelled?"CANCELLED_BEFORE_EXECUTION":"OUTCOME_UNCERTAIN",cancelled?"UI request cancelled before execution":"UI operation is running; do not repeat the action");
+   return Error(cancelled?"CANCELLED_BEFORE_EXECUTION":"OUTCOME_UNCERTAIN",cancelled?"UI request cancelled before execution":"UI operation started; do not repeat the action");
+  }
+  static Dictionary<string,object> Observe(Dictionary<string,object> request) {
+   var answer=(Dictionary<string,object>)OnUI(delegate{return Snapshot(request);},Budget(request,1500,5000));
+   string code=S(answer,"code");
+   if(code=="NOT_READY"||code=="CANCELLED_BEFORE_EXECUTION"||code=="OUTCOME_UNCERTAIN")return Pending("engine-busy");
+   return answer;
+  }
+  static Dictionary<string,object> Status(Dictionary<string,object> request) {
+   var answer=(Dictionary<string,object>)OnUI(delegate { var c=ReadControl();var status=Map("ok",true,"state",c.State);AddLifecycle(status,c);return status; },Budget(request,500,1000));
+   string code=S(answer,"code");if(code=="NOT_READY"||code=="CANCELLED_BEFORE_EXECUTION"||code=="OUTCOME_UNCERTAIN")answer=Pending("engine-busy");
+   answer["sessionId"]=SessionId;answer["exited"]=Exited;answer["failure"]=Failure;answer["engineAssembly"]=Engine==null?null:Engine.FullName;answer["engineFamily"]="framework";answer["runtimeMode"]=Settings==null?"copy":S(Settings,"runtimeMode","copy");answer["gameDir"]=GameDir;answer["runtimeDirectory"]=RuntimeDir;answer["processId"]=System.Diagnostics.Process.GetCurrentProcess().Id;
+   return answer;
   }
   [StructLayout(LayoutKind.Sequential)] struct SecurityAttributes { public int Length;public IntPtr Descriptor;public int Inherit; }
   [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern Microsoft.Win32.SafeHandles.SafePipeHandle CreateNamedPipe(string name,uint openMode,uint pipeMode,uint instances,uint outSize,uint inSize,uint timeout,ref SecurityAttributes attributes);
@@ -174,10 +292,10 @@ namespace EraDSH {
   }
   static object Dispatch(Dictionary<string,object> request) {
    string action=S(request,"action");
-   if(action=="status")return Map("ok",true,"sessionId",SessionId,"ready",Window!=null,"exited",Exited,"failure",Failure,"engineAssembly",Engine.FullName,"runtimeMode",S(Settings,"runtimeMode","copy"),"gameDir",GameDir,"runtimeDirectory",RuntimeDir,"processId",System.Diagnostics.Process.GetCurrentProcess().Id);
+   if(action=="status")return Status(request);
    if(action=="close")return Map("ok",true,"status","normal_close_scheduled");
-   if(action=="observe")return OnUI(delegate{return Snapshot(request);});
-   if(action=="advance")return OnUI(delegate{return Advance(request);});
+   if(action=="observe")return Observe(request);
+   if(action=="advance")return Advance(request);
    if(action!="act")return Error("UNKNOWN_ACTION","Use status, observe, act, or close");
    string actionId=S(request,"actionId");Guid parsed;
    if(!Guid.TryParse(actionId,out parsed))return Error("INVALID_ACTION_ID","A unique GUID actionId is required");
@@ -188,13 +306,24 @@ namespace EraDSH {
     Actions[actionId]=Map("actionId",actionId,"state","queued");
    }
    Record("action-intent",Map("actionId",actionId,"observationId",S(request,"observationId"),"kind",S(request,"kind"),"value",S(request,"value"),"choiceId",S(request,"choiceId")));
-   var result=OnUI(delegate {
+   int actionBudget=Budget(request,6000,6000);var actionClock=System.Diagnostics.Stopwatch.StartNew();
+   var result=(Dictionary<string,object>)OnUI(delegate {
     lock(Gate)Actions[actionId]["state"]="executing";
     object answer;
     try { answer=Act(request);lock(Gate){Actions[actionId]["state"]="completed";Actions[actionId]["result"]=answer;} }
     catch(Exception ex){answer=Error("ACTION_OUTCOME_UNCERTAIN",Root(ex).Message);lock(Gate){Actions[actionId]["state"]="uncertain";Actions[actionId]["result"]=answer;} }
     Record("action-result",Map("actionId",actionId,"result",answer));return answer;
-   });
+   },Math.Min(actionBudget,5000));
+   lock(Gate) {
+    if(S(Actions[actionId],"state")=="queued") { Actions[actionId]["state"]=S(result,"code")=="CANCELLED_BEFORE_EXECUTION"||S(result,"code")=="NOT_READY"?"cancelled":"uncertain";Actions[actionId]["result"]=result; }
+    else if(S(Actions[actionId],"state")=="executing"&&S(result,"code")=="OUTCOME_UNCERTAIN") { Actions[actionId]["state"]="uncertain";Actions[actionId]["result"]=result; }
+   }
+   if(result.ContainsKey("submitted")&&Convert.ToBoolean(result["submitted"],CultureInfo.InvariantCulture)) {
+    // Yield to the message loop before sampling the result; never promise synchronous readiness.
+    int remaining=actionBudget-(int)actionClock.ElapsedMilliseconds;
+    var after=remaining>0?Observe(Map("mode",S(request,"mode","text"),"limitLines",I(request,"limitLines",80),"timeoutMs",Math.Min(remaining,750))):Pending("post-action-budget");
+    result["observation"]=after;result["observationChanged"]=S(after,"observationId")!=S(request,"observationId");
+   }
    return result;
   }
   static string Clip(string text,int length) { return text!=null&&text.Length>length?text.Substring(0,length):text; }
@@ -289,43 +418,45 @@ namespace EraDSH {
    result["delta"]=delta;result["text"]=null;result["lines"]=null;
   }
 
-  // Era narration is printed a few lines at a time and only needs "Enter" between
-  // chunks. This loop presses Enter while the engine waits for a plain key and stops
-  // the moment a decision is required, so one call can carry a whole scene.
+  // Each narration step is one short UI operation, with a message-loop turn between steps.
+  static Dictionary<string,object> AdvanceStep() {
+   Control c;try { c=ReadControl(); }catch(MissingMemberException ex) { return ContractError(ex); }
+   if(!c.CanAct)return Map("ok",true,"submitted",false,"stoppedBecause",c.Timed?"timed-wait":"not-waiting-input");
+   if(!KeyKind(S(c.Input,"kind"))||(bool)c.Input["needValue"])return Map("ok",true,"submitted",false,"stoppedBecause","input-required");
+   ConsumeInput(c);Call(ConsoleObject,"PressEnterKey",new[]{typeof(bool),typeof(string),typeof(bool)},false,"",false);
+   return Map("ok",true,"submitted",true);
+  }
   static Dictionary<string,object> Advance(Dictionary<string,object> request) {
-   int maxSteps=request.ContainsKey("maxSteps")?Math.Max(1,Math.Min(200,I(request,"maxSteps",20))):20;
-   string mode=S(request,"mode","text");int limit=I(request,"limitLines",80);
-   var press=ConsoleObject.GetType().GetMethod("PressEnterKey",Members,null,new[]{typeof(bool),typeof(string),typeof(bool)},null);
-   var snapshot=Snapshot(Map("mode",mode,"limitLines",limit));
-   int steps=0;string stopped="max-steps";string previousId=Convert.ToString(snapshot["observationId"]);
-   while(true) {
-    string state=Convert.ToString(snapshot["state"]);
-    if(state!="WaitInput") { stopped="not-waiting-input";break; }
-    var input=(Dictionary<string,object>)snapshot["input"];
-    string kind=Convert.ToString(input["kind"]);bool needValue=(bool)input["needValue"];
-    if(needValue||kind=="IntValue"||kind=="StrValue"||kind=="IntButton"||kind=="StrButton"||kind=="AnyValue"||kind=="Void") { stopped="input-required";break; }
-    if(kind!="EnterKey"&&kind!="AnyKey") { stopped="input-required";break; }
-    if(steps>=maxSteps) { stopped="max-steps";break; }
-    if(press==null) { stopped="adapter-member-missing";break; }
-    press.Invoke(ConsoleObject,new object[]{false,"",false});
+   int maxSteps=Math.Max(1,Math.Min(200,I(request,"maxSteps",20))),budget=Budget(request,8000,8000),steps=0;
+   var clock=System.Diagnostics.Stopwatch.StartNew();string stopped="max-steps";
+   Dictionary<string,object> snapshot=null;
+   while(steps<maxSteps) {
+    int remaining=budget-(int)clock.ElapsedMilliseconds;if(remaining<=0){stopped="pending";break;}
+    var step=(Dictionary<string,object>)OnUI(delegate { return AdvanceStep(); },Math.Min(remaining,1000));
+    if(!step.ContainsKey("submitted")||!Convert.ToBoolean(step["submitted"],CultureInfo.InvariantCulture)) {
+     stopped=S(step,"stoppedBecause",S(step,"code","not-waiting-input"));break;
+    }
     steps++;
-    var next=Snapshot(Map("mode",mode,"limitLines",limit));
-    string nextId=Convert.ToString(next["observationId"]);
-    if(string.Equals(nextId,previousId,StringComparison.Ordinal)) { stopped="stalled";snapshot=next;break; }
-    previousId=nextId;snapshot=next;
+    remaining=budget-(int)clock.ElapsedMilliseconds;if(remaining<=0){stopped="pending";break;}
+    snapshot=Observe(Map("mode","text","limitLines",I(request,"limitLines",80),"timeoutMs",Math.Min(remaining,750)));
+    if(!snapshot.ContainsKey("canAct")||!Convert.ToBoolean(snapshot["canAct"],CultureInfo.InvariantCulture)){stopped="pending";break;}
    }
+   int left=budget-(int)clock.ElapsedMilliseconds;
+   if(left>0)snapshot=Observe(Map("mode",S(request,"mode","text"),"limitLines",I(request,"limitLines",80),"timeoutMs",Math.Min(left,750)));
+   if(snapshot==null)snapshot=Pending("advance-budget");
    return Map("ok",true,"steps",steps,"stoppedBecause",stopped,"observation",snapshot);
   }
 
   static Dictionary<string,object> Snapshot(Dictionary<string,object> request) {
+   try { return SnapshotCore(request); }catch(MissingMemberException ex) { return ContractError(ex); }
+  }
+  static Dictionary<string,object> SnapshotCore(Dictionary<string,object> request) {
    int limit=I(request,"limitLines",80);if(limit<1||limit>200)throw new ArgumentOutOfRangeException("limitLines","Use 1..200");
    string mode=S(request,"mode","text");if(mode!="text"&&mode!="visual"&&mode!="both"&&mode!="auto")throw new ArgumentException("Invalid observation mode");
    var buffer=new StringBuilder(1024,8*1024*1024);Call(ConsoleObject,"GetDisplayStrings",new Type[]{typeof(StringBuilder)},buffer);
    if(buffer.Length>8*1024*1024)throw new InvalidOperationException("Engine display buffer exceeds the 8 Mi-character internal limit");
-   string full=buffer.ToString();string state=Convert.ToString(Field(ConsoleObject,"state"));object req=Field(ConsoleObject,"inputReq");
-   var input=Map("kind",req==null?"Void":Convert.ToString(Field(req,"InputType")),"requestId",req==null?"":Convert.ToString(Field(req,"ID"),CultureInfo.InvariantCulture),"oneInput",req!=null&&(bool)Field(req,"OneInput"),"needValue",req!=null&&(bool)Prop(req,"NeedValue"),"timeLimit",req==null?0:Field(req,"Timelimit"),"systemInput",req!=null&&(bool)Field(req,"IsSystemInput"));
-   bool needValue=req!=null&&(bool)Prop(req,"NeedValue");
-   var list=(IList)Field(ConsoleObject,"displayLineList");int start=Math.Max(0,list.Count-limit);if(request.ContainsKey("fromLine"))start=Math.Max(0,Math.Min(list.Count,I(request,"fromLine",0)));
+   var control=ReadControl();string full=buffer.ToString(),state=control.State;var input=control.Input;
+   var list=control.Lines;int start=Math.Max(0,list.Count-limit);if(request.ContainsKey("fromLine"))start=Math.Max(0,Math.Min(list.Count,I(request,"fromLine",0)));
    // A cursor is expressed in the engine's absolute line space (deleted + buffered)
    // so it keeps meaning when the engine trims old rows.
    long deletedLines=0;
@@ -339,9 +470,7 @@ namespace EraDSH {
     if(requested<deletedLines||requested>deletedLines+list.Count)cursorExpired=true;
     else start=Math.Max(0,Math.Min(list.Count,(int)(requested-deletedLines)));
    }
-   int nextGeneration=Convert.ToInt32(Field(ConsoleObject,"newButtonGeneration"),CultureInfo.InvariantCulture);
-   int currentGeneration=0;
-   foreach(object line in list)foreach(object b in (Array)Prop(line,"Buttons"))if((bool)Prop(b,"IsButton"))currentGeneration=Math.Max(currentGeneration,Convert.ToInt32(Prop(b,"Generation"),CultureInfo.InvariantCulture));
+   int currentGeneration=Convert.ToInt32(control.Generation,CultureInfo.InvariantCulture);
    bool includeInactive=request.ContainsKey("includeInactive")&&Convert.ToBoolean(request["includeInactive"],CultureInfo.InvariantCulture);
    // lines[] duplicates text one-for-one; act responses skip it unless the caller asks.
    bool includeLines=request.ContainsKey("includeLines")&&Convert.ToBoolean(request["includeLines"],CultureInfo.InvariantCulture);
@@ -362,25 +491,22 @@ namespace EraDSH {
      text.Append(value);text.Append("\r\n");characterBudget-=value.Length+2;textCut|=cut;
      if(includeLines)lines.Add(Map("index",n,"lineNo",lineNo,"text",value,"truncated",cut));
     }else textCut=true;
-    var items=(Array)Prop(line,"Buttons");
-    for(int j=0;j<items.Length;j++) {
-     object b=items.GetValue(j);if(!(bool)Prop(b,"IsButton"))continue;
-     bool integer=(bool)Prop(b,"IsInteger");string val=integer?Convert.ToString(Prop(b,"Input"),CultureInfo.InvariantCulture):Convert.ToString(Prop(b,"Inputs"));val=val??"";
-     string generation=Convert.ToString(Prop(b,"Generation"),CultureInfo.InvariantCulture),label=b.ToString();bool valueTooLong=val.Length>2048;
-     bool active=needValue&&string.Equals(generation,currentGeneration.ToString(CultureInfo.InvariantCulture),StringComparison.Ordinal);
-     if(!active&&!includeInactive){omittedInactive++;continue;}
-     if(buttons.Count==128){buttons.RemoveAt(0);omittedButtons++;}
-     buttons.Add(Map("id","b-"+lineNo+"-"+j+"-"+generation,"label",Clip(label,512),"labelTruncated",label.Length>512,"value",valueTooLong?null:val,"valueTooLong",valueTooLong,"choosable",!valueTooLong,"active",active,"integer",integer,"generation",generation,"lineIndex",n));
-    }
+   }
+   // Options are independent of the text page and the text character budget.
+   foreach(var entry in control.Buttons) {
+    if(!(bool)entry["active"]&&!includeInactive){omittedInactive++;continue;}
+    if(buttons.Count==128){buttons.RemoveAt(0);omittedButtons++;}
+    var shown=new Dictionary<string,object>(entry);shown.Remove("key");buttons.Add(shown);
    }
    string fingerprint=ObservationHash(state,input,full,list,currentGeneration);
-   var result=Map("ok",true,"sessionId",SessionId,"observationId",SessionId+":"+fingerprint,"capturedUtc",DateTime.UtcNow.ToString("o"),"source","engine-display-buffer","consistency","same-ui-thread; animation frames are not revision-tracked","state",state,"input",input,"title",Clip(Window.Text,512),"text",mode=="visual"?null:text.ToString(),"lines",(mode=="visual"||!includeLines)?null:lines,"buttons",buttons,"buttonGeneration",currentGeneration,"omittedInactiveButtons",omittedInactive,"omittedButtons",omittedButtons,"filteredNoiseLines",filteredNoise,"collapsedSeparators",collapsed,"cursor",deletedLines+list.Count,"nextCursor",deletedLines+Math.Min(list.Count,start+limit),"cursorBase",deletedLines,"cursorExpired",cursorExpired,"totalLines",list.Count,"fromLine",start,"returnedLines",includeLines?lines.Count:0,"omittedBefore",start,"omittedAfter",Math.Max(0,list.Count-start-limit),"rawTextLength",full.Length,"textTruncated",textCut,"textCharacterBudget",24000,"window",Map("handle",Window.Handle.ToInt64(),"clientWidth",Window.ClientSize.Width,"clientHeight",Window.ClientSize.Height));
+   var result=Map("ok",true,"sessionId",SessionId,"observationId",SessionId+":"+Hash(fingerprint+":"+control.Epoch),"displayHash",fingerprint,"capturedUtc",DateTime.UtcNow.ToString("o"),"source","engine-display-buffer","consistency","same-ui-thread; animation frames are not revision-tracked","state",state,"input",input,"title",Clip(Window.Text,512),"text",mode=="visual"?null:text.ToString(),"lines",(mode=="visual"||!includeLines)?null:lines,"buttons",buttons,"buttonGeneration",currentGeneration,"omittedInactiveButtons",omittedInactive,"omittedButtons",omittedButtons,"filteredNoiseLines",filteredNoise,"collapsedSeparators",collapsed,"cursor",deletedLines+list.Count,"nextCursor",deletedLines+Math.Min(list.Count,start+limit),"cursorBase",deletedLines,"cursorExpired",cursorExpired,"totalLines",list.Count,"fromLine",start,"returnedLines",includeLines?lines.Count:0,"omittedBefore",start,"omittedAfter",Math.Max(0,list.Count-start-limit),"rawTextLength",full.Length,"textTruncated",textCut,"textCharacterBudget",24000,"window",Map("handle",Window.Handle.ToInt64(),"clientWidth",Window.ClientSize.Width,"clientHeight",Window.ClientSize.Height));
+   AddLifecycle(result,control);
    if(mode=="visual"||mode=="both"||mode=="auto")result["screenshot"]=Capture();
    if(request.ContainsKey("sinceObservationId")) {
     var since=Convert.ToString(request["sinceObservationId"]);
     if(!string.IsNullOrEmpty(since))ApplyDelta(result,since,displayed,displayedIndex);
    }
-   RememberHistory(Convert.ToString(result["observationId"]),displayed);
+   RememberHistory(Convert.ToString(result["observationId"]),displayed);RememberDelivered(result,control);
    return result;
   }
   static object Capture() {
@@ -398,25 +524,27 @@ namespace EraDSH {
    }
   }
   static object Act(Dictionary<string,object> request) {
-   var current=Snapshot(Map("mode","text","limitLines",200));
-   if(S(request,"observationId")!=S(current,"observationId"))return Map("ok",false,"code","STALE_OBSERVATION","current",current);
-   if(S(current,"state")!="WaitInput")return Map("ok",false,"code","NOT_WAITING_INPUT","current",current);
-   var input=(Dictionary<string,object>)current["input"];string inputKind=S(input,"kind"),kind=S(request,"kind"),value=S(request,"value");
+   Control c;try { c=ReadControl(); }catch(MissingMemberException ex) { return ContractError(ex); }
+   var live=Lifecycle(c);live["state"]=c.State;live["input"]=c.Input;
+   if(!c.CanAct)return Map("ok",false,"code","NOT_WAITING_INPUT","current",live);
+   Delivered delivered;lock(Gate)DeliveredObservations.TryGetValue(S(request,"observationId"),out delivered);
+   if(delivered==null||delivered.Epoch!=c.Epoch)return Map("ok",false,"code","STALE_OBSERVATION","current",live);
+   string inputKind=S(c.Input,"kind"),kind=S(request,"kind"),value=S(request,"value");
    if(kind=="choose") {
-    if(!(bool)input["needValue"])return Error("WRONG_INPUT_KIND","Current request does not accept a button; use continue");
-    Dictionary<string,object> chosen=null;
-    foreach(object row in (List<object>)current["buttons"]) {var b=(Dictionary<string,object>)row;if(S(b,"id")==S(request,"choiceId")){chosen=b;break;}}
-    if(chosen==null)return Error("CHOICE_NOT_FOUND","Choice is absent from the current observation");if(!(bool)chosen["active"])return Error("STALE_BUTTON","Button belongs to an older screen generation; observe again");if(!(bool)chosen["choosable"])return Error("CHOICE_VALUE_TOO_LONG","Button value exceeds the action limit");value=S(chosen,"value");
+    if(!(bool)c.Input["needValue"])return Error("WRONG_INPUT_KIND","Current request does not accept a button; use continue");
+    string key;if(!delivered.Choices.TryGetValue(S(request,"choiceId"),out key))return Error("CHOICE_NOT_FOUND","Choice was not delivered with this observation");
+    Dictionary<string,object> chosen=null;foreach(var b in c.Buttons)if((bool)b["active"]&&S(b,"key")==key){chosen=b;break;}
+    if(chosen==null)return Error("STALE_BUTTON","Choice is not valid for the live input request");
+    if(!(bool)chosen["choosable"])return Error("CHOICE_VALUE_TOO_LONG","Button value exceeds the action limit");value=S(chosen,"value");
    } else if(kind=="continue") {
-    if(inputKind!="EnterKey"&&inputKind!="AnyKey")return Error("WRONG_INPUT_KIND","Continue requires an EnterKey/AnyKey request");value="";
+    if(!KeyKind(inputKind)||c.Timed||c.SystemInput)return Error("WRONG_INPUT_KIND","Continue requires an untimed user EnterKey/AnyKey request");value="";
    } else if(kind!="input")return Error("INVALID_ACTION_KIND","Use choose, input, or continue");
    if(value.Length>2048||value.IndexOfAny(new char[]{'\r','\n','\0'})>=0||value.StartsWith("@",StringComparison.Ordinal))return Error("INVALID_INPUT","Input is bounded single-line text; debug commands are not exposed");
-   long number;if(inputKind=="IntValue"&&!Int64.TryParse(value,NumberStyles.AllowLeadingSign,CultureInfo.InvariantCulture,out number))return Error("INTEGER_REQUIRED","Current request expects an integer");
-   if(kind!="continue"&&inputKind!="IntValue"&&inputKind!="StrValue")return Error("WRONG_INPUT_KIND","Use continue for key waits");
-   // Exact verified signature, dispatched on the engine UI thread. No window focus required.
-   Call(ConsoleObject,"PressEnterKey",new Type[]{typeof(bool),typeof(string),typeof(bool)},false,value,false);
-   var after=Snapshot(Map("mode",S(request,"mode","text"),"limitLines",80,"includeLines",false));
-   return Map("ok",true,"actionId",S(request,"actionId"),"submitted",true,"value",value,"observationChanged",S(after,"observationId")!=S(current,"observationId"),"observation",after);
+   long number;if(IntegerKind(inputKind)&&!Int64.TryParse(value,NumberStyles.AllowLeadingSign,CultureInfo.InvariantCulture,out number))return Error("INTEGER_REQUIRED","Current request expects an integer");
+   if(kind!="continue"&&!ValueKind(inputKind))return Error("WRONG_INPUT_KIND","Use continue for key waits");
+   // Validate and submit atomically on the UI thread. Do not sample a post-action screen here.
+   ConsumeInput(c);Call(ConsoleObject,"PressEnterKey",new Type[]{typeof(bool),typeof(string),typeof(bool)},false,value,false);
+   return Map("ok",true,"actionId",S(request,"actionId"),"submitted",true,"value",value,"inputEpoch",c.Epoch);
   }
  }
 }

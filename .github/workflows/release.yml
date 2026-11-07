@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '[0-9]*.[0-9]*.[0-9]*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      VERSION: ${{ github.ref_name }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate release version and notes
+        shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          import { readFileSync } from 'node:fs'
+          const { version } = JSON.parse(readFileSync('package.json', 'utf8'))
+          if (!/^\d+\.\d+\.\d+$/.test(process.env.VERSION) || version !== process.env.VERSION) {
+            throw new Error(`Tag ${process.env.VERSION} does not match package version ${version}`)
+          }
+          JS
+          test -s "docs/releases/${VERSION}.md"
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$VERSION" --json tagName --jq .tagName >/dev/null 2>&1; then
+            gh release edit "$VERSION" --title "$VERSION" --notes-file "docs/releases/${VERSION}.md" --draft=false --latest
+          else
+            gh release create "$VERSION" --verify-tag --title "$VERSION" --notes-file "docs/releases/${VERSION}.md" --latest
+          fi

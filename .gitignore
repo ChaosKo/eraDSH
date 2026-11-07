@@ -21,3 +21,5 @@ bridge/net8/**/bin/
 bridge/net8/**/obj/
 tools/**/bin/
 tools/**/obj/
+/tests/bin/
+/tests/obj/

@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
@@ -27,7 +28,7 @@ const stateFile = join(stateRoot, 'last-session.json')
 const ACTIONS = ['build', 'open', 'status', 'observe', 'act', 'advance', 'close']
 const RUNTIME_MODES = ['inplace', 'copy']
 
-function run({ powershell, script, args }) {
+export function run({ powershell, script, args, timeoutMs = 30_000 }) {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(powershell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, ...args], {
       windowsHide: true,
@@ -35,12 +36,29 @@ function run({ powershell, script, args }) {
     })
     let stdout = ''
     let stderr = ''
+    let settled = false
+    let exited = false
+    const finish = (error, value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      if (error) reject(error)
+      else resolvePromise(value)
+    }
+    const timer = setTimeout(() => {
+      // Kill only this invocation's client, never the independently managed game.
+      if (!exited) child.kill()
+      child.stdout.destroy()
+      child.stderr.destroy()
+      finish(new Error(`Bridge client deadline exceeded (${timeoutMs} ms${exited ? '; client exited but output pipes stayed open' : ''}). Inspect status before retrying; never resend an uncertain action with a new actionId.`))
+    }, timeoutMs)
     child.stdout.setEncoding('utf8')
     child.stderr.setEncoding('utf8')
-    child.stdout.on('data', chunk => { if (stdout.length < 4_000_000) stdout += chunk })
-    child.stderr.on('data', chunk => { if (stderr.length < 65_536) stderr += chunk })
-    child.on('error', reject)
-    child.on('close', code => resolvePromise({ code, stdout, stderr }))
+    child.stdout.on('data', chunk => { if (stdout.length < 4_000_000) stdout += chunk.slice(0, 4_000_000 - stdout.length) })
+    child.stderr.on('data', chunk => { if (stderr.length < 65_536) stderr += chunk.slice(0, 65_536 - stderr.length) })
+    child.on('error', error => finish(error))
+    child.on('exit', () => { exited = true })
+    child.on('close', code => finish(null, { code, stdout, stderr }))
   })
 }
 
@@ -88,11 +106,11 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => ctx.tools.register({
     name: 'era_bridge',
     description:
-      'Build a session and read or control a managed Era game through the local eraDSH bridge. Start with action=build (gameRoot is the Era game folder); every other action then works without sessionFile because the last build is remembered. Always observe before acting: act requires the observation id from the latest observation, and the bridge rejects stale, duplicate, or malformed actions. Text comes from the engine display buffer; screenshots are saved as files and must be viewed separately.',
+      'Build a session and read or control a managed Era game. Start with build and the game folder; later calls remember that session. Open returns a launch receipt, not a ready screen. Observe until canAct=true before submitting input; pending=true means the engine is still busy. Act uses an observationId tied to the current input request, so decorative redraws do not invalidate it but a new input request does. Text comes from the engine display buffer; screenshot files must be viewed separately.',
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ACTIONS, description: 'build prepares a session for a game folder; open only launches the managed instance and returns immediately with launched=true and pending=true (it never waits for a screen); call observe afterwards, and observe again while the reply still says pending=true; observe reads state; act submits one input; advance presses Enter repeatedly while the game is only narrating (stops when a button, a value, a text entry, a non-waiting state or maxSteps is reached); status reports liveness; close shuts the managed instance down cleanly.' },
+        action: { type: 'string', enum: ACTIONS, description: 'build prepares a session; open launches and returns launched=true, pending=true without waiting for IPC or a screen; observe returns phase/pending/canAct and should be repeated while pending; act submits one input from an actionable observation; advance continues only untimed narration, stopping at a decision, busy state, deadline or maxSteps; status reports liveness but does not authorize input; close requests a normal shutdown.' },
         maxSteps: { type: 'integer', minimum: 1, maximum: 200, description: 'advance only: how many Enter presses to allow before returning (default 20). The reply says steps and stoppedBecause (input-required, not-waiting-input, max-steps, stalled).' },
         gameRoot: { type: 'string', description: 'Absolute path of the Era game folder. Required by build; the scripts that operate it ship inside this plugin, so no repository path is ever needed.' },
         engineExecutable: { type: 'string', description: 'Optional launcher file name inside gameRoot; omitted, the engine is detected automatically.' },
@@ -102,7 +120,7 @@ export function apply(ctx, config = {}) {
         mode: { type: 'string', enum: ['text', 'visual', 'both', 'auto'], description: 'Observation content. auto currently behaves like both.' },
         includeLines: { type: 'boolean', description: 'Include the per-line array. It duplicates text one-for-one, so observations omit it unless this is true.' },
         sinceCursor: { type: 'integer', description: 'Continue from a line cursor: pass nextCursor from the previous page to read the next block of lines, or cursor to follow the tail. cursorExpired is true when the engine already dropped those rows; the reply then carries the current window instead.' },
-        sinceObservationId: { type: 'string', description: 'Incremental observe: pass the observation id you already hold and the reply carries only the difference (delta.kind = append/changed/none, or full when the base is unknown or too large). The observation id still hashes the whole screen, so actions remain safe.' },
+        sinceObservationId: { type: 'string', description: 'Incremental observe: pass a prior observation id to receive delta.kind=append/changed/none, or full when the base is unavailable or too large. Display revision is independent of pagination; inputEpoch separately identifies the live input request.' },
         noise: { type: 'string', enum: ['filter', 'raw'], description: 'filter (default) drops engine loading chatter (読み込み/ロード/Loading lines, bare .erb/.erh/.csv listings) and collapses long separator runs, reporting counts in filteredNoiseLines and collapsedSeparators; raw returns the display buffer verbatim.' },
         limitLines: { type: 'integer', minimum: 1, maximum: 200, description: 'Maximum display-buffer lines to return.' },
         fromLine: { type: 'integer', minimum: 0, description: 'Zero-based display-buffer line to start from; omit for the newest page.' },
@@ -136,7 +154,7 @@ export function apply(ctx, config = {}) {
         if (args.engineExecutable) cli.push('-EngineExecutable', String(args.engineExecutable))
         if (args.recreate === true) cli.push('-Recreate')
 
-        const { code, stdout, stderr } = await run({ powershell, script: builder, args: cli })
+        const { code, stdout, stderr } = await run({ powershell, script: builder, args: cli, timeoutMs: 180_000 })
         if (code !== 0) {
           const detail = (stderr.trim() || stdout.trim() || 'no diagnostic output').slice(0, 2000)
           throw new Error(`era_bridge build failed (exit ${code}): ${detail}`)
@@ -162,16 +180,20 @@ export function apply(ctx, config = {}) {
       if (args.sinceCursor != null) cli.push('-SinceCursor', String(args.sinceCursor))
       if (action === 'advance' && args.maxSteps != null) cli.push('-MaxSteps', String(args.maxSteps))
       if (args.noise) cli.push('-Noise', String(args.noise))
+      const actionId = action === 'act' ? String(args.actionId || randomUUID()) : undefined
       if (action === 'act') {
         if (!args.observationId) throw new Error('act requires observationId from the latest observation')
         cli.push('-ObservationId', String(args.observationId))
         cli.push('-Kind', String(args.kind ?? 'input'))
         if (args.value != null) cli.push('-Value', String(args.value))
         if (args.choiceId) cli.push('-ChoiceId', String(args.choiceId))
-        if (args.actionId) cli.push('-ActionId', String(args.actionId))
+        cli.push('-ActionId', actionId)
       }
 
-      const { code, stdout, stderr } = await run({ powershell, script, args: cli })
+      const { code, stdout, stderr } = await run({ powershell, script, args: cli }).catch(error => {
+        if (actionId) error.message += ` actionId=${actionId}`
+        throw error
+      })
       if (code !== 0) {
         const detail = stderr.trim() || stdout.trim() || 'no diagnostic output'
         throw new Error(`era_bridge client failed (exit ${code}): ${detail.slice(0, 2000)}`)

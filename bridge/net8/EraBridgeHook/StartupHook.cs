@@ -55,9 +55,21 @@ internal static class Bridge
     private static Type _consoleType;
     private static bool _serving;
     private static Dictionary<string, object> _cached;
-    private static readonly Dictionary<string, Dictionary<string, object>> Recent = new();
+    // Only observations actually returned to the caller enter this bounded map.
+    // A delivery remembers a token/choices, never a historical authority snapshot.
+    private sealed class Delivery
+    {
+        internal string Epoch;
+        internal readonly Dictionary<string, string> Choices = new(StringComparer.Ordinal);
+    }
+    private static readonly Dictionary<string, Delivery> Recent = new(StringComparer.Ordinal);
     private static readonly Queue<string> RecentOrder = new();
     private static DateTime _cachedAt = DateTime.MinValue;
+    private static object _epochRequest, _epochConsole;
+    private static string _epochSignature, _inputEpoch, _consumedEpoch;
+    private static long _inputSerial;
+    private static readonly object UiGate = new();
+    private static UiWork _uiWork;
     private static string _failure;
     private static int _imageNumber;
     private static int _idleTicks;
@@ -127,11 +139,11 @@ internal static class Bridge
         }
         if (_console != null)
         {
+            lock (Gate) if ((DateTime.UtcNow - _cachedAt).TotalMilliseconds < 100) return;
             try
             {
                 RefreshTargets();
-                _cached = SnapshotCore(new Dictionary<string, object> { ["mode"] = "text", ["limitLines"] = 200 });
-                _cachedAt = DateTime.UtcNow;
+                Cache(SnapshotCore(new Dictionary<string, object> { ["mode"] = "text", ["limitLines"] = 200, ["history"] = false }));
             }
             catch { }
             return;
@@ -143,8 +155,7 @@ internal static class Bridge
                 Record("ready", new { window = _window.GetType().FullName, title = _window.Text, console = _consoleType.FullName, tick = _idleTicks });
                 try
                 {
-                    _cached = SnapshotCore(new Dictionary<string, object> { ["mode"] = "text", ["limitLines"] = 200 });
-                    _cachedAt = DateTime.UtcNow;
+                    Cache(SnapshotCore(new Dictionary<string, object> { ["mode"] = "text", ["limitLines"] = 200, ["history"] = false }));
                 }
                 catch { }
             }
@@ -177,7 +188,8 @@ internal static class Bridge
                     string response;
                     try
                     {
-                        var request = JsonDocument.Parse(ReadRequest(reader)).RootElement;
+                        using var document = JsonDocument.Parse(ReadRequest(reader));
+                        var request = document.RootElement;
                         if (request.GetProperty("token").GetString() != Str("token"))
                         {
                             response = Json(Error("UNAUTHORIZED", "Local session credential required"));
@@ -248,33 +260,97 @@ internal static class Bridge
         }
     }
 
-    // Ready means "parked on a decision", not merely "has text": a title fade-in also
-    // reports WaitInput with lines on screen, and answering there hands the caller a
-    // screen with no menu. A real stop either offers buttons, wants a value, or waits
-    // for a key without a limit timer.
-    private static bool IsSteadySnapshot(Dictionary<string, object> snapshot)
+    private static bool Flag(Dictionary<string, object> value, string key) =>
+        value != null && value.TryGetValue(key, out var flag) && flag is true;
+
+    private static Deadline RequestDeadline(JsonElement request, int fallback, int maximum)
     {
-        if (snapshot is null) return false;
-        var state = Convert.ToString(snapshot["state"]);
-        if (string.IsNullOrEmpty(state) || state == "Initializing" || state == "Running" || state == "Sleep")
-        {
-            return false;
-        }
-        if (!snapshot.TryGetValue("totalLines", out var totalLines) || Convert.ToInt32(totalLines) <= 0) return false;
+        var budget = request.TryGetProperty("timeoutMs", out var value) ? value.GetInt32() : fallback;
+        return new Deadline(Math.Clamp(budget, 1, maximum));
+    }
 
-        if (snapshot.TryGetValue("buttons", out var buttonsValue) && buttonsValue is List<object> buttons && buttons.Count > 0)
+    private static Dictionary<string, object> PendingSnapshot(string reason)
+    {
+        Dictionary<string, object> result;
+        DateTime captured;
+        lock (Gate)
         {
-            return true;
+            result = _cached is null ? new() : new(_cached);
+            captured = _cachedAt;
         }
+        result["ok"] = true;
+        result["sessionId"] = _sessionId;
+        result["attached"] = _console != null && _window is { IsDisposed: false };
+        result["ready"] = false;
+        result["canAct"] = false;
+        result["canAdvance"] = false;
+        result["pending"] = true;
+        result["phase"] = _failure != null ? "failed" : Flag(result, "attached") ? "loading" : "starting";
+        result["readinessReason"] = reason;
+        result["stale"] = true;
+        result["observationAgeMs"] = captured == DateTime.MinValue ? -1L : (long)(DateTime.UtcNow - captured).TotalMilliseconds;
+        // Never issue a usable input credential from a cache-only result.
+        result.Remove("inputEpoch");
+        if (_failure != null) result["failure"] = _failure;
+        return result;
+    }
 
-        if (!snapshot.TryGetValue("input", out var inputValue) || inputValue is not Dictionary<string, object> input) return false;
-        var kind = Convert.ToString(input["kind"]);
-        if (kind == "IntValue" || kind == "StrValue" || kind == "IntButton" || kind == "StrButton" || kind == "AnyValue")
+    private static Dictionary<string, object> Observe(JsonElement request)
+    {
+        // Parse/copy before queuing: callbacks must not retain a JsonDocument lifetime.
+        var options = OptionsFrom(request);
+        var sampleOptions = new Dictionary<string, object>(options) { ["mode"] = "text" };
+        var deadline = RequestDeadline(request, 6000, 8000);
+        Dictionary<string, object> latest = null;
+        while (!deadline.Expired)
         {
-            return true;
+            var fresh = OnUi(() =>
+            {
+                var snapshot = SnapshotCore(sampleOptions);
+                if (Flag(snapshot, "canAct") && !deadline.Expired) AddVisual(snapshot, options);
+                return snapshot;
+            }, deadline, 1000);
+            if (Flag(fresh, "ok"))
+            {
+                latest = fresh;
+                Cache(fresh);
+                if (Flag(fresh, "canAct") || Convert.ToString(fresh["phase"]) == "failed")
+                    return Deliver(fresh);
+            }
+            else if (Convert.ToString(fresh.GetValueOrDefault("code")) == "OUTCOME_UNCERTAIN")
+            {
+                // One in-flight sample owns the slot; never queue behind a busy UI.
+                return PendingSnapshot("ui-sample-running");
+            }
+            if (!deadline.Expired) Thread.Sleep(Math.Min(75, deadline.Remaining));
         }
-        var timeLimit = input.TryGetValue("timeLimit", out var limitValue) ? Convert.ToInt64(limitValue, CultureInfo.InvariantCulture) : -1L;
-        return (kind == "EnterKey" || kind == "AnyKey") && timeLimit <= 0;
+        if (latest != null)
+        {
+            latest = new(latest);
+            latest["canAct"] = false;
+            latest["canAdvance"] = false;
+            latest["ready"] = false;
+            latest["pending"] = true;
+            latest["readinessReason"] = "observe-deadline";
+            return Deliver(latest);
+        }
+        return PendingSnapshot("ui-unavailable-before-deadline");
+    }
+
+    private static void Cache(Dictionary<string, object> snapshot)
+    {
+        lock (Gate) { _cached = snapshot; _cachedAt = DateTime.UtcNow; }
+    }
+
+    private static void AddVisual(Dictionary<string, object> snapshot, Dictionary<string, object> options)
+    {
+        var mode = Convert.ToString(options.GetValueOrDefault("mode", "text"));
+        if (mode == "visual" || mode == "both" || mode == "auto")
+        {
+            try { snapshot["screenshot"] = Capture(); }
+            catch (Exception ex) { snapshot["screenshotError"] = Root(ex).Message; }
+        }
+        if (mode == "visual") { snapshot["text"] = null; snapshot["lines"] = null; }
     }
 
     private static string Dispatch(JsonElement request)
@@ -283,64 +359,23 @@ internal static class Bridge
         switch (action)
         {
             case "status":
-                return Json(new Dictionary<string, object>
-                {
-                    ["ok"] = true,
-                    ["sessionId"] = _sessionId,
-                    ["ready"] = _console != null,
-                    ["exited"] = false,
-                    ["failure"] = _failure,
-                    ["engineFamily"] = "core",
-                    ["launchMode"] = "startup-hook",
-                    ["gameDir"] = Str("gameRoot"),
-                    ["processId"] = Environment.ProcessId,
-                    ["launched"] = true,
-                    ["pending"] = _cached is null || !IsSteadySnapshot(_cached),
-                    ["state"] = _cached is null ? "starting" : Convert.ToString(_cached["state"]),
-                    ["totalLines"] = _cached is null ? 0 : Convert.ToInt32(_cached["totalLines"]),
-                });
+            {
+                var status = PendingSnapshot("fresh-observation-required");
+                status.Remove("text"); status.Remove("lines"); status.Remove("buttons"); status.Remove("screenshot");
+                status["exited"] = ExitedSafe();
+                if (ExitedSafe()) status["phase"] = "exited";
+                status["engineFamily"] = "core";
+                status["launchMode"] = "startup-hook";
+                status["gameDir"] = Str("gameRoot");
+                status["processId"] = Environment.ProcessId;
+                status["launched"] = true;
+                status["requiresObservation"] = true;
+                return Json(status);
+            }
             case "close":
                 return Json(new Dictionary<string, object> { ["ok"] = true, ["status"] = "normal_close_scheduled" });
             case "observe":
-            {
-                var budget = Environment.GetEnvironmentVariable("ERA_BRIDGE_READY_MS") is { Length: > 0 } ms && int.TryParse(ms, out var parsed) ? parsed : 20000;
-                var waited = System.Diagnostics.Stopwatch.StartNew();
-                // The idle-refreshed cache is only a fast path: while the engine animates,
-                // Application.Idle can stop firing and the cache freezes on an early frame.
-                // So also ask the UI thread directly for a fresh snapshot until one shows a
-                // decision screen (or the budget runs out).
-                while (waited.ElapsedMilliseconds < budget)
-                {
-                    if (IsSteadySnapshot(CachedSnapshot())) break;
-                    var fresh = TryFresh(request, 3000);
-                    if (fresh is not null)
-                    {
-                        _cached = fresh;
-                        _cachedAt = DateTime.UtcNow;
-                        if (IsSteadySnapshot(fresh)) break;
-                    }
-                    Thread.Sleep(100);
-                }
-                var cached = CachedSnapshot();
-                Record("observe-wait", new
-                {
-                    waitedMs = (int)waited.ElapsedMilliseconds,
-                    steady = IsSteadySnapshot(cached),
-                    cacheAgeMs = _cached is null ? -1 : (int)(DateTime.UtcNow - _cachedAt).TotalMilliseconds,
-                    state = cached is null ? null : Convert.ToString(cached["state"]),
-                    lines = cached is null ? 0 : Convert.ToInt32(cached["totalLines"]),
-                });
-                if (!IsSteadySnapshot(cached))
-                {
-                    // Never block on a screen that never becomes "steady": answer with what
-                    // is known and let the caller decide whether to look again.
-                    if (cached is null) return Json(Error("NOT_READY", "engine has no screen yet"));
-                    cached["pending"] = true;
-                    cached["observationAgeMs"] = (int)(DateTime.UtcNow - _cachedAt).TotalMilliseconds;
-                    return Json(cached);
-                }
-                return Json(Snapshot(request));
-            }
+                return Json(Observe(request));
             case "act":
                 return Act(request);
             case "advance":
@@ -350,226 +385,210 @@ internal static class Bridge
         }
     }
 
-    // Era narration is printed a few lines at a time and only needs "Enter" between
-    // chunks. This loop presses Enter while the engine is waiting for a plain key and
-    // stops the moment a decision is required, so one call can carry a whole scene
-    // without spending one round trip per paragraph.
+    // Each step is its own UI operation: timers/posted engine work get a turn
+    // between inputs, and the one request deadline bounds the whole advance.
     private static string Advance(JsonElement request)
     {
+        var options = OptionsFrom(request);
+        var sampleOptions = new Dictionary<string, object>(options) { ["mode"] = "text" };
         var maxSteps = request.TryGetProperty("maxSteps", out var stepsValue) ? Math.Clamp(stepsValue.GetInt32(), 1, 200) : 20;
-        var mode = GetString(request, "mode") is { Length: > 0 } modeValue ? modeValue : "text";
-        var limit = request.TryGetProperty("limitLines", out var limitValue) ? limitValue.GetInt32() : 80;
-        var press = _consoleType?.GetMethod("PressEnterKey", AnyInstance, null, new[] { typeof(bool), typeof(string), typeof(bool) }, null);
-
-        var result = OnUi(() =>
+        var deadline = RequestDeadline(request, 10000, 10000);
+        var steps = 0;
+        var stopped = "deadline";
+        Dictionary<string, object> snapshot = null;
+        string submittedEpoch = null;
+        var progress = System.Diagnostics.Stopwatch.StartNew();
+        while (!deadline.Expired)
         {
-            var snapshot = SnapshotCore(new Dictionary<string, object> { ["mode"] = mode, ["limitLines"] = limit });
-            var steps = 0;
-            var stopped = "max-steps";
-            var previousId = Convert.ToString(snapshot["observationId"]);
-
-            while (true)
+            var step = OnUi(() =>
             {
-                var state = Convert.ToString(snapshot["state"]);
-                if (state != "WaitInput")
-                {
-                    stopped = "not-waiting-input";
-                    break;
-                }
-
-                var input = (Dictionary<string, object>)snapshot["input"];
-                var kind = Convert.ToString(input["kind"]);
-                var needValue = input.TryGetValue("needValue", out var need) && need is bool needBool && needBool;
-
-                if (needValue || kind == "IntValue" || kind == "StrValue" || kind == "IntButton" || kind == "StrButton" || kind == "AnyValue" || kind == "Void")
-                {
-                    stopped = "input-required";
-                    break;
-                }
-                if (kind != "EnterKey" && kind != "AnyKey")
-                {
-                    stopped = "input-required";
-                    break;
-                }
+                var current = SnapshotCore(sampleOptions);
+                var waitingForEngine = Convert.ToString(current["state"]) is "Running" or "Initializing" or "Sleep";
+                if (submittedEpoch != null && (Convert.ToString(current["inputEpoch"]) == submittedEpoch ||
+                    (!Flag(current, "canAct") && waitingForEngine)))
+                    return new() { ["ok"] = true, ["waitingForProgress"] = true, ["observation"] = current };
+                if (!Flag(current, "canAdvance"))
+                    return new() { ["ok"] = true, ["stop"] = Flag(current, "canAct") ? "input-required" : "not-waiting-input", ["observation"] = current };
                 if (steps >= maxSteps)
-                {
-                    stopped = "max-steps";
-                    break;
-                }
-                if (press is null)
-                {
-                    stopped = "adapter-member-missing";
-                    break;
-                }
-
+                    return new() { ["ok"] = true, ["stop"] = "max-steps", ["observation"] = current };
+                var press = _consoleType.GetMethod("PressEnterKey", AnyInstance, null, new[] { typeof(bool), typeof(string), typeof(bool) }, null);
+                if (press is null) return Error("ADAPTER_MEMBER_MISSING", "PressEnterKey(bool,string,bool) is absent");
+                if (deadline.Expired) return Error("CANCELLED_BEFORE_EXECUTION", "Advance deadline expired before input");
+                _consumedEpoch = Convert.ToString(current["inputEpoch"]);
                 press.Invoke(_console, new object[] { false, string.Empty, false });
-                steps++;
-
-                var next = SnapshotCore(new Dictionary<string, object> { ["mode"] = mode, ["limitLines"] = limit });
-                var nextId = Convert.ToString(next["observationId"]);
-                if (string.Equals(nextId, previousId, StringComparison.Ordinal))
-                {
-                    // Pressing changed nothing twice in a row: the engine is animating or
-                    // ignoring the key, so stop instead of hammering it.
-                    stopped = "stalled";
-                    snapshot = next;
-                    break;
-                }
-                previousId = nextId;
-                snapshot = next;
-            }
-
-            return new Dictionary<string, object>
+                Interlocked.Increment(ref steps);
+                return new() { ["ok"] = true, ["submittedEpoch"] = _consumedEpoch, ["observation"] = SnapshotCore(sampleOptions) };
+            }, deadline, Math.Min(1000, deadline.Remaining));
+            if (!Flag(step, "ok"))
             {
-                ["ok"] = true,
-                ["steps"] = steps,
-                ["stoppedBecause"] = stopped,
-                ["observation"] = snapshot,
-            };
-        });
-        return Json(result);
+                stopped = Convert.ToString(step.GetValueOrDefault("code"));
+                // If a step has started, it may finish after this response. Do not
+                // make a repeatable-looking success out of an uncertain input.
+                step["steps"] = Volatile.Read(ref steps);
+                step["stoppedBecause"] = stopped;
+                if (snapshot != null) step["observation"] = Deliver(snapshot);
+                return Json(step);
+            }
+            snapshot = (Dictionary<string, object>)step["observation"];
+            Cache(snapshot);
+            if (step.TryGetValue("stop", out var stop)) { stopped = Convert.ToString(stop); break; }
+            if (step.TryGetValue("submittedEpoch", out var sent))
+            {
+                submittedEpoch = Convert.ToString(sent);
+                progress.Restart();
+            }
+            else if (Flag(step, "waitingForProgress") && progress.ElapsedMilliseconds >= 750)
+            {
+                stopped = "stalled";
+                break;
+            }
+            if (!deadline.Expired) Thread.Sleep(Math.Min(25, deadline.Remaining));
+        }
+        if (snapshot is null) snapshot = PendingSnapshot("advance-deadline");
+        else
+        {
+            // This optional final projection shares the same deadline, never adds
+            // another long wait after all the steps have consumed the budget.
+            if (!deadline.Expired)
+            {
+                var final = OnUi(() => { var x = SnapshotCore(sampleOptions); AddVisual(x, options); return x; }, deadline, Math.Min(300, deadline.Remaining));
+                if (Flag(final, "ok")) snapshot = final;
+            }
+            Deliver(snapshot);
+        }
+        return Json(new Dictionary<string, object> { ["ok"] = true, ["steps"] = Volatile.Read(ref steps), ["stoppedBecause"] = stopped, ["observation"] = snapshot });
     }
 
     private static string Act(JsonElement request)
     {
-        var actionId = GetString(request, "actionId");
+        var options = OptionsFrom(request);
+        var command = request.Clone();
+        var deadline = RequestDeadline(request, 5000, 5000);
+        var actionId = GetString(command, "actionId");
         if (!Guid.TryParse(actionId, out var parsed)) return Json(Error("INVALID_ACTION_ID", "A unique GUID actionId is required"));
         actionId = parsed.ToString("D");
         lock (Gate)
         {
             if (Actions.TryGetValue(actionId, out var prior))
-            {
-                return Json(new Dictionary<string, object> { ["ok"] = false, ["code"] = "DUPLICATE_ACTION", ["action"] = prior });
-            }
+                return Json(new Dictionary<string, object> { ["ok"] = false, ["code"] = "DUPLICATE_ACTION", ["action"] = new Dictionary<string, object>(prior) });
             if (Actions.Count >= 10000) return Json(Error("ACTION_LIMIT", "Session action limit reached"));
-            Actions[actionId] = new Dictionary<string, object> { ["actionId"] = actionId, ["state"] = "queued" };
+            Actions[actionId] = new() { ["actionId"] = actionId, ["state"] = "queued", ["submissionStarted"] = false };
         }
-
-        Record("action-intent", new
-        {
-            actionId,
-            observationId = GetString(request, "observationId"),
-            kind = GetString(request, "kind"),
-            value = GetString(request, "value"),
-            choiceId = GetString(request, "choiceId"),
-        });
-
+        Record("action-intent", new { actionId, observationId = GetString(command, "observationId"), kind = GetString(command, "kind") });
         var result = OnUi(() =>
         {
             lock (Gate) Actions[actionId]["state"] = "executing";
-            try
-            {
-                var answer = ActCore(request, actionId);
-                lock (Gate)
-                {
-                    Actions[actionId]["state"] = "completed";
-                    Actions[actionId]["result"] = answer;
-                }
-                Record("action-result", new { actionId, result = answer });
-                return answer;
-            }
+            Dictionary<string, object> answer;
+            try { answer = ActCore(command, actionId, options, deadline); }
             catch (Exception ex)
             {
-                var answer = Error("ACTION_OUTCOME_UNCERTAIN", Root(ex).Message);
-                lock (Gate) Actions[actionId]["state"] = "uncertain";
-                Record("action-result", new { actionId, result = answer });
-                return answer;
+                bool submitted;
+                lock (Gate) submitted = Flag(Actions[actionId], "submissionStarted");
+                answer = Error(submitted ? "ACTION_OUTCOME_UNCERTAIN" : "ENGINE_ERROR", Root(ex).Message);
             }
-        });
+            lock (Gate)
+            {
+                var code = Convert.ToString(answer.GetValueOrDefault("code"));
+                Actions[actionId]["state"] = Flag(answer, "submitted") ? "completed" :
+                    code == "CANCELLED_BEFORE_EXECUTION" ? "cancelled" :
+                    code.Contains("UNCERTAIN", StringComparison.Ordinal) ? "uncertain" : "rejected";
+                Actions[actionId]["result"] = answer;
+            }
+            Record("action-result", new { actionId, result = answer });
+            return answer;
+        }, deadline);
+        lock (Gate)
+        {
+            var state = Convert.ToString(Actions[actionId]["state"]);
+            if (state == "queued")
+            {
+                Actions[actionId]["state"] = "cancelled";
+                Actions[actionId]["result"] = result;
+            }
+            else if (state == "executing")
+            {
+                Actions[actionId]["state"] = "uncertain";
+                Actions[actionId]["result"] = result;
+            }
+        }
+        if (result.TryGetValue("observation", out var returned) && returned is Dictionary<string, object> observation) Deliver(observation);
+        if (result.TryGetValue("current", out var currentValue) && currentValue is Dictionary<string, object> current) Deliver(current);
         return Json(result);
     }
 
-    private static Dictionary<string, object> ActCore(JsonElement request, string actionId)
+    private static Dictionary<string, object> ActCore(JsonElement request, string actionId, Dictionary<string, object> options, Deadline deadline)
     {
+        // This callback is on the UI thread. Neither Recent nor the idle cache may
+        // supply live state, an input contract, active choices, or permission.
+        var current = SnapshotCore(new Dictionary<string, object> { ["mode"] = "text", ["limitLines"] = 200 });
         var claimed = GetString(request, "observationId");
-        Dictionary<string, object> known;
-        lock (Recent) Recent.TryGetValue(claimed, out known);
-        if (known is null)
+        Delivery delivery;
+        lock (Recent) Recent.TryGetValue(claimed, out delivery);
+        var currentEpoch = Convert.ToString(current["inputEpoch"]);
+        if (delivery is null || !string.Equals(delivery.Epoch, currentEpoch, StringComparison.Ordinal))
         {
-            var fallback = CachedSnapshot();
-            if (fallback != null && (string)fallback["observationId"] == claimed) known = fallback;
+            var stale = Error("STALE_OBSERVATION", "Observe the current input request before acting");
+            stale["discriminator"] = delivery is null ? "unknown-delivered-observation" : "input-epoch-changed";
+            stale["claimedInputEpoch"] = delivery?.Epoch;
+            stale["currentInputEpoch"] = currentEpoch;
+            stale["currentRequestId"] = ((Dictionary<string, object>)current["input"])["requestId"];
+            stale["current"] = current;
+            return stale;
         }
-        var current = known ?? CachedSnapshot() ?? SnapshotCore(new Dictionary<string, object> { ["mode"] = "text", ["limitLines"] = 200 });
-        if (known is null && claimed != (string)current["observationId"])
-        {
-            return new Dictionary<string, object> { ["ok"] = false, ["code"] = "STALE_OBSERVATION", ["current"] = current };
-        }
-        if ((string)current["state"] != "WaitInput")
-        {
-            return new Dictionary<string, object> { ["ok"] = false, ["code"] = "NOT_WAITING_INPUT", ["current"] = current };
-        }
+        if (!Flag(current, "canAct"))
+            return new() { ["ok"] = false, ["code"] = "NOT_WAITING_INPUT", ["discriminator"] = "current-not-actionable", ["current"] = current };
 
         var input = (Dictionary<string, object>)current["input"];
-        var inputKind = (string)input["kind"];
+        var inputKind = Convert.ToString(input["kind"]);
         var kind = GetString(request, "kind");
         var value = GetString(request, "value");
-
         if (kind == "choose")
         {
-            if (!(bool)input["needValue"]) return Error("WRONG_INPUT_KIND", "Current request does not accept a button; use continue");
-            Dictionary<string, object> chosen = null;
-            foreach (var entry in (List<object>)current["buttons"])
-            {
-                var button = (Dictionary<string, object>)entry;
-                if ((string)button["id"] == GetString(request, "choiceId")) { chosen = button; break; }
-            }
-            if (chosen is null) return Error("CHOICE_NOT_FOUND", "Choice is absent from the current observation");
-            if (!(bool)chosen["active"]) return Error("STALE_BUTTON", "Button belongs to an older screen generation; observe again");
-            if (!(bool)chosen["choosable"]) return Error("CHOICE_VALUE_TOO_LONG", "Button value exceeds the action limit");
-            value = (string)chosen["value"];
+            if (!Flag(input, "needValue")) return Error("WRONG_INPUT_KIND", "Current request does not accept a value");
+            if (!delivery.Choices.TryGetValue(GetString(request, "choiceId"), out var choiceToken))
+                return Error("CHOICE_NOT_FOUND", "Choice was not delivered in this observation");
+            // Match a full live semantic choice, not its old display position.
+            var frame = ReadInputFrame((IList)_consoleType.GetProperty("DisplayLineList", AnyInstance).GetValue(_console));
+            if (!frame.CanAct || frame.Epoch != currentEpoch) return Error("STALE_OBSERVATION", "Live choice request changed during validation");
+            var chosen = frame.Buttons.Find(b => b.Active && b.Token == choiceToken);
+            if (chosen is null) return Error("STALE_BUTTON", "Choice is absent from the current input request");
+            if (chosen.Value.Length > 2048) return Error("CHOICE_VALUE_TOO_LONG", "Button value exceeds the action limit");
+            value = chosen.Value;
         }
         else if (kind == "continue")
         {
-            if (inputKind != "EnterKey" && inputKind != "AnyKey" && inputKind != "PrimitiveMouseKey")
-            {
-                return Error("WRONG_INPUT_KIND", "Continue requires an EnterKey/AnyKey request");
-            }
+            if (inputKind != "EnterKey" && inputKind != "AnyKey") return Error("WRONG_INPUT_KIND", "Continue requires an untimed EnterKey/AnyKey request");
             value = string.Empty;
         }
-        else if (kind != "input")
-        {
-            return Error("INVALID_ACTION_KIND", "Use choose, input, or continue");
-        }
-
+        else if (kind != "input") return Error("INVALID_ACTION_KIND", "Use choose, input, or continue");
         if (value.Length > 2048 || value.IndexOfAny(new[] { '\r', '\n', '\0' }) >= 0 || value.StartsWith("@", StringComparison.Ordinal))
-        {
             return Error("INVALID_INPUT", "Input is bounded single-line text; debug commands are not exposed");
-        }
         if ((inputKind == "IntValue" || inputKind == "IntButton") && !long.TryParse(value, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out _))
-        {
             return Error("INTEGER_REQUIRED", "Current request expects an integer");
-        }
-        if (kind != "continue" && inputKind != "IntValue" && inputKind != "IntButton" && inputKind != "StrValue" && inputKind != "StrButton" && inputKind != "AnyValue")
-        {
-            return Error("WRONG_INPUT_KIND", "Use continue for key waits");
-        }
-
+        if (kind != "continue" && !ValueInput(inputKind)) return Error("WRONG_INPUT_KIND", "Use continue for key waits");
         var press = _consoleType.GetMethod("PressEnterKey", AnyInstance, null, new[] { typeof(bool), typeof(string), typeof(bool) }, null);
-        if (press is null) return Error("ADAPTER_MEMBER_MISSING", "EmueraConsole.PressEnterKey(bool,string,bool) is absent in this build");
+        if (press is null) return Error("ADAPTER_MEMBER_MISSING", "PressEnterKey(bool,string,bool) is absent");
+        if (deadline.Expired) return Error("CANCELLED_BEFORE_EXECUTION", "Action deadline expired before input");
+        lock (Gate) Actions[actionId]["submissionStarted"] = true;
+        _consumedEpoch = currentEpoch;
         press.Invoke(_console, new object[] { false, value, false });
-
-        var mode = GetString(request, "mode") is { Length: > 0 } m ? m : "text";
-        var limit = request.TryGetProperty("limitLines", out var ll) ? ll.GetInt32() : 80;
-        var after = SnapshotCore(new Dictionary<string, object> { ["mode"] = mode, ["limitLines"] = limit, ["includeLines"] = false });
-        _cached = after;
-        _cachedAt = DateTime.UtcNow;
-
-        return new Dictionary<string, object>
+        var answer = new Dictionary<string, object> { ["ok"] = true, ["actionId"] = actionId, ["submitted"] = true, ["value"] = value };
+        try
         {
-            ["ok"] = true,
-            ["actionId"] = actionId,
-            ["submitted"] = true,
-            ["value"] = value,
-            ["observationChanged"] = (string)after["observationId"] != (string)current["observationId"],
-            ["observation"] = after,
-        };
-    }
-
-    private static Dictionary<string, object> CachedSnapshot()
-    {
-        var cached = _cached;
-        var fresh = cached != null && (DateTime.UtcNow - _cachedAt).TotalSeconds < 5;
-        return fresh ? cached : null;
+            var afterOptions = new Dictionary<string, object>(options) { ["mode"] = "text" };
+            var after = SnapshotCore(afterOptions);
+            if (!deadline.Expired) AddVisual(after, options);
+            Cache(after);
+            answer["observationChanged"] = Convert.ToString(after["observationId"]) != Convert.ToString(current["observationId"]);
+            answer["observation"] = after;
+        }
+        catch (Exception ex)
+        {
+            // A screenshot/projection failure after submission is not a failed key.
+            answer["observationError"] = Root(ex).Message;
+            answer["pending"] = true;
+        }
+        return answer;
     }
 
     // Era engines print a wall of loading chatter at startup. The wording is
@@ -638,13 +657,16 @@ internal static class Bridge
         {
             options["cursor"] = sinceCursor.GetInt64();
         }
+        var selectedMode = Convert.ToString(options["mode"]);
+        if (selectedMode != "text" && selectedMode != "visual" && selectedMode != "both" && selectedMode != "auto")
+            throw new ArgumentException("mode must be text, visual, both or auto");
+        if (options.TryGetValue("limitLines", out var count) && (Convert.ToInt32(count) < 1 || Convert.ToInt32(count) > 200))
+            throw new ArgumentOutOfRangeException("limitLines", "Use 1..200");
+        if (options.TryGetValue("fromLine", out var start) && Convert.ToInt32(start) < 0) throw new ArgumentOutOfRangeException("fromLine");
+        if (options.TryGetValue("cursor", out var cursor) && Convert.ToInt64(cursor) < 0) throw new ArgumentOutOfRangeException("sinceCursor");
+        if (options.TryGetValue("noise", out var selectedNoise) && Convert.ToString(selectedNoise) != "raw" && Convert.ToString(selectedNoise) != "filter")
+            throw new ArgumentException("noise must be raw or filter");
         return options;
-    }
-
-    private static Dictionary<string, object> Snapshot(JsonElement request)
-    {
-        var options = OptionsFrom(request);
-        return OnUi(() => SnapshotCore(options));
     }
 
     private static Dictionary<string, object> SnapshotCore(Dictionary<string, object> options)
@@ -693,30 +715,10 @@ internal static class Bridge
             }
         }
 
-        var state = _consoleType.GetProperty("state", AnyInstance)?.GetValue(_console)?.ToString() ?? "unknown";
-        var request = _consoleType.GetField("inputReq", AnyInstance)?.GetValue(_console);
-        var input = DescribeInput(request);
-        var needValue = input.TryGetValue("needValue", out var nv) && nv is bool b && b;
-
-        // First pass across all display lines: determine the latest button generation on screen,
-        // matching EraBridgeHost.cs semantics (newButtonGeneration is the *next* generation counter).
-        long currentGeneration = 0;
-        for (var idx = 0; idx < allLines.Count; idx++)
-        {
-            var lineObj = allLines[idx];
-            var arr = lineObj?.GetType().GetProperty("Buttons", AnyInstance)?.GetValue(lineObj) as Array;
-            if (arr is null) continue;
-            for (var bi = 0; bi < arr.Length; bi++)
-            {
-                var btn = arr.GetValue(bi);
-                if (btn is null) continue;
-                var bt = btn.GetType();
-                if (!(bool)(bt.GetProperty("IsButton", AnyInstance)?.GetValue(btn) ?? false)) continue;
-                var gen = Convert.ToInt64(bt.GetProperty("Generation", AnyInstance)?.GetValue(btn) ?? 0L, CultureInfo.InvariantCulture);
-                if (gen > currentGeneration) currentGeneration = gen;
-            }
-        }
-        var currentGenStr = currentGeneration.ToString(CultureInfo.InvariantCulture);
+        var frame = ReadInputFrame(allLines);
+        var state = frame.State;
+        var input = frame.Input;
+        var currentGeneration = frame.Generation;
 
         var lines = new List<object>();
         var buttons = new List<object>();
@@ -771,60 +773,36 @@ internal static class Bridge
             }
         }
 
-        // Collect active buttons across all display lines so buttons above the text window are not lost.
-        for (var index = 0; index < allLines.Count; index++)
+        // Authorization/fingerprinting use every semantic button. The bounded
+        // output is just a view and is deliberately independent of text filtering.
+        foreach (var button in frame.Buttons)
         {
-            var line = allLines[index];
-            var lineNo = Convert.ToInt32(line?.GetType().GetField("LineNo", AnyInstance)?.GetValue(line) ?? index);
-            if (filterNoise && IsLoadNoise(line?.ToString() ?? string.Empty)) continue;
-            var lineButtons = line?.GetType().GetProperty("Buttons", AnyInstance)?.GetValue(line) as Array;
-            if (lineButtons is null) continue;
-            for (var buttonIndex = 0; buttonIndex < lineButtons.Length; buttonIndex++)
+            if (!button.Active) { omittedInactive++; continue; }
+            if (buttons.Count == 128) { buttons.RemoveAt(0); omittedButtons++; }
+            buttons.Add(new Dictionary<string, object>
             {
-                var button = lineButtons.GetValue(buttonIndex);
-                if (button is null) continue;
-                var type = button.GetType();
-                if (!(bool)(type.GetProperty("IsButton", AnyInstance)?.GetValue(button) ?? false)) continue;
-
-                var isInteger = (bool)(type.GetProperty("IsInteger", AnyInstance)?.GetValue(button) ?? false);
-                var rawValue = isInteger
-                    ? Convert.ToString(type.GetProperty("Input", AnyInstance)?.GetValue(button), CultureInfo.InvariantCulture) ?? string.Empty
-                    : Convert.ToString(type.GetProperty("Inputs", AnyInstance)?.GetValue(button), CultureInfo.InvariantCulture) ?? string.Empty;
-                var generation = Convert.ToString(type.GetProperty("Generation", AnyInstance)?.GetValue(button), CultureInfo.InvariantCulture) ?? "0";
-                var active = needValue && string.Equals(generation, currentGenStr, StringComparison.Ordinal);
-                if (!active) { omittedInactive++; continue; }
-
-                if (buttons.Count == 128)
-                {
-                    buttons.RemoveAt(0);
-                    omittedButtons++;
-                }
-
-                var label = button.ToString() ?? string.Empty;
-                buttons.Add(new Dictionary<string, object>
-                {
-                    ["id"] = "b-" + lineNo + "-" + buttonIndex + "-" + generation,
-                    ["label"] = label.Length > 512 ? label.Substring(0, 512) : label,
-                    ["labelTruncated"] = label.Length > 512,
-                    ["value"] = rawValue.Length > 2048 ? null : rawValue,
-                    ["valueTooLong"] = rawValue.Length > 2048,
-                    ["choosable"] = rawValue.Length <= 2048,
-                    ["active"] = active,
-                    ["integer"] = isInteger,
-                    ["generation"] = generation,
-                    ["lineIndex"] = index,
-                });
-            }
+                ["id"] = button.Id,
+                ["label"] = button.Label.Length > 512 ? button.Label.Substring(0, 512) : button.Label,
+                ["labelTruncated"] = button.Label.Length > 512,
+                ["value"] = button.Value.Length > 2048 ? null : button.Value,
+                ["valueTooLong"] = button.Value.Length > 2048,
+                ["choosable"] = button.Value.Length <= 2048,
+                ["active"] = button.Active,
+                ["integer"] = button.Integer,
+                ["generation"] = button.Generation,
+                ["lineIndex"] = button.LineIndex,
+            });
         }
-
-        var fingerprint = Hash(string.Join("|", new[]
+        long rawTextLength = 0;
+        foreach (var line in allLines)
         {
-            state,
-            Json(input),
-            text.ToString(),
-            string.Join(",", buttons.ConvertAll(x => Json(x))),
-            currentGenStr,
-        }));
+            rawTextLength += (line?.ToString()?.Length ?? 0) + 2L;
+            if (rawTextLength > 8 * 1024 * 1024) throw new InvalidOperationException("Engine display buffer exceeds 8 Mi characters");
+        }
+        var fingerprint = HashParts(SnapshotParts(frame, allLines));
+        var projection = HashParts(new[] { mode, limit.ToString(CultureInfo.InvariantCulture),
+            Convert.ToString(options.GetValueOrDefault("fromLine"), CultureInfo.InvariantCulture),
+            Convert.ToString(options.GetValueOrDefault("cursor"), CultureInfo.InvariantCulture), filterNoise.ToString() });
 
         var result = new Dictionary<string, object>
         {
@@ -833,7 +811,16 @@ internal static class Bridge
             ["observationId"] = _sessionId + ":" + fingerprint,
             ["capturedUtc"] = DateTime.UtcNow.ToString("o"),
             ["source"] = "engine-display-buffer",
-            ["consistency"] = "same-ui-thread; animation frames are not revision-tracked",
+            ["consistency"] = "same-ui-thread; input epoch independent of presentation",
+            ["inputEpoch"] = frame.Epoch,
+            ["projectionId"] = projection,
+            ["attached"] = true,
+            ["pending"] = !frame.CanAct,
+            ["canAct"] = frame.CanAct,
+            ["canAdvance"] = frame.CanAdvance,
+            ["ready"] = frame.CanAct,
+            ["phase"] = frame.Phase,
+            ["readinessReason"] = frame.Reason,
             ["engineFamily"] = "core",
             ["state"] = state,
             ["input"] = input,
@@ -855,7 +842,7 @@ internal static class Bridge
             ["returnedLines"] = includeLines ? lines.Count : 0,
             ["omittedBefore"] = start,
             ["omittedAfter"] = Math.Max(0, allLines.Count - start - limit),
-            ["rawTextLength"] = text.Length,
+            ["rawTextLength"] = rawTextLength,
             ["textTruncated"] = textCut,
             ["textCharacterBudget"] = 24000,
             ["window"] = _window is null ? null : new Dictionary<string, object>
@@ -874,8 +861,8 @@ internal static class Bridge
         {
             ApplyDelta(result, since, displayed, displayedIndex);
         }
-        RememberHistory(Convert.ToString(result["observationId"]), displayed);
-        Remember(result);
+        if (!options.TryGetValue("history", out var history) || history is not false)
+            RememberHistory(Convert.ToString(result["observationId"]) + ":" + projection, displayed);
         return result;
     }
 
@@ -927,8 +914,8 @@ internal static class Bridge
     // A caller that already has an observation can ask for the difference instead of
     // the whole screen. The comparison runs over the lines as they were delivered
     // (after filtering and separator collapsing), so the indices match what the caller
-    // saw; the observation id still hashes the whole buffer, so a delta never weakens
-    // the stale-check for actions.
+    // saw. Observation ids hash the full buffer; input authorization is separately
+    // checked against the live input epoch, regardless of a delta's text projection.
     private static readonly Dictionary<string, List<string>> DeltaHistory = new();
     private static readonly Queue<string> DeltaOrder = new();
 
@@ -948,7 +935,7 @@ internal static class Bridge
         var delta = new Dictionary<string, object>();
         List<string> previous;
         var known = false;
-        lock (DeltaHistory) known = DeltaHistory.TryGetValue(since, out previous);
+        lock (DeltaHistory) known = DeltaHistory.TryGetValue(since + ":" + Convert.ToString(result["projectionId"]), out previous);
 
         if (!known)
         {
@@ -976,11 +963,12 @@ internal static class Bridge
         var kind = common == previous.Count ? "append" : "changed";
         var tail = displayed.Count - common;
         const int cap = 200;
-        if (tail > cap)
+        var tailCharacters = displayed.Skip(common).Sum(line => (long)line.Length + 2);
+        if (tail > cap || tailCharacters > 24000)
         {
             // Too much to send as a delta; the full text is already in the result.
             delta["kind"] = "full";
-            delta["reason"] = "delta exceeds " + cap + " lines";
+            delta["reason"] = "delta exceeds bounded line/character budget";
             result["delta"] = delta;
             return;
         }
@@ -1005,54 +993,150 @@ internal static class Bridge
         result["lines"] = null;
     }
 
-    private static void Remember(Dictionary<string, object> snapshot)
+    private static Dictionary<string, object> Deliver(Dictionary<string, object> snapshot)
     {
-        var id = Convert.ToString(snapshot["observationId"]);
-        if (string.IsNullOrEmpty(id)) return;
+        if (!Flag(snapshot, "canAct") || !snapshot.TryGetValue("observationId", out var idValue) ||
+            !snapshot.TryGetValue("inputEpoch", out var epochValue)) return snapshot;
+        var id = Convert.ToString(idValue);
+        var delivery = new Delivery { Epoch = Convert.ToString(epochValue) };
+        if (snapshot.TryGetValue("buttons", out var buttonsValue) && buttonsValue is List<object> buttons)
+            foreach (Dictionary<string, object> button in buttons)
+                if (Flag(button, "active") && Flag(button, "choosable"))
+                    delivery.Choices[Convert.ToString(button["id"])] = ChoiceToken(Convert.ToString(button["generation"]), Flag(button, "integer"), Convert.ToString(button["value"]));
         lock (Recent)
         {
             if (!Recent.ContainsKey(id)) RecentOrder.Enqueue(id);
-            Recent[id] = snapshot;
-            while (RecentOrder.Count > 16) Recent.Remove(RecentOrder.Dequeue());
+            Recent[id] = delivery;
+            while (RecentOrder.Count > 64) Recent.Remove(RecentOrder.Dequeue());
         }
+        return snapshot;
     }
 
-    private static Dictionary<string, object> DescribeInput(object request)
+    private sealed class ButtonInfo
     {
-        var runningTimer = false;
-        try
+        internal string Id, Value, Generation, Label, Token;
+        internal bool Integer, Active;
+        internal int LineIndex;
+    }
+
+    private sealed class InputFrame
+    {
+        internal string State, Epoch, Phase, Reason;
+        internal bool ContractValid, CanAct, CanAdvance;
+        internal long Generation;
+        internal Dictionary<string, object> Input;
+        internal readonly List<ButtonInfo> Buttons = new();
+    }
+
+    private static bool TryRead(object target, string name, out object value)
+    {
+        value = null;
+        if (target is null) return false;
+        var type = target.GetType();
+        var field = type.GetField(name, AnyInstance);
+        if (field != null) { value = field.GetValue(target); return true; }
+        var property = type.GetProperty(name, AnyInstance);
+        if (property is null || property.GetIndexParameters().Length != 0) return false;
+        value = property.GetValue(target);
+        return true;
+    }
+
+    private static bool ValueInput(string kind) => kind == "IntValue" || kind == "StrValue" ||
+        kind == "IntButton" || kind == "StrButton" || kind == "AnyValue";
+
+    private static string ChoiceToken(string generation, bool integer, string value) =>
+        HashParts(new[] { generation, integer ? "integer" : "text", value });
+
+    private static InputFrame ReadInputFrame(IList allLines)
+    {
+        var missing = new List<string>();
+        object Required(object target, string member)
         {
-            if (_console != null)
+            if (!TryRead(target, member, out var value) || value is null) { missing.Add(member); return null; }
+            return value;
+        }
+        var state = Convert.ToString(Required(_console, "state"));
+        var request = Required(_console, "inputReq");
+        var kind = Convert.ToString(Required(request, "InputType"));
+        var id = Convert.ToString(Required(request, "ID"), CultureInfo.InvariantCulture);
+        var oneValue = Required(request, "OneInput");
+        var needValue = Required(request, "NeedValue");
+        var limitValue = Required(request, "Timelimit");
+        var systemValue = Required(request, "IsSystemInput");
+        var timerValue = Required(_console, "IsRunningTimer");
+        if (oneValue is not bool) missing.Add("OneInput:bool");
+        if (needValue is not bool) missing.Add("NeedValue:bool");
+        if (systemValue is not bool) missing.Add("IsSystemInput:bool");
+        if (timerValue is not bool) missing.Add("IsRunningTimer:bool");
+        var limit = limitValue is null ? 0L : Convert.ToInt64(limitValue, CultureInfo.InvariantCulture);
+        var timed = limit > 0 || timerValue is true;
+        var input = new Dictionary<string, object>
+        {
+            ["kind"] = string.IsNullOrEmpty(kind) ? "Void" : kind,
+            ["requestId"] = id,
+            ["oneInput"] = oneValue is true,
+            ["needValue"] = needValue is true,
+            ["timeLimit"] = limit,
+            ["runningTimer"] = timerValue is true,
+            ["systemInput"] = systemValue is true,
+            ["timed"] = timed,
+            ["timedUserInput"] = timed && ValueInput(kind),
+        };
+        var frame = new InputFrame { State = state, Input = input };
+        var hasGeneration = TryRead(_console, "lastButtonGeneration", out var generation);
+        if (hasGeneration) frame.Generation = Convert.ToInt64(generation, CultureInfo.InvariantCulture);
+        for (var index = 0; index < allLines.Count; index++)
+        {
+            var line = allLines[index];
+            var lineNo = TryRead(line, "LineNo", out var number) ? Convert.ToInt32(number, CultureInfo.InvariantCulture) : index;
+            if (!TryRead(line, "Buttons", out var array) || array is not Array buttons) continue;
+            for (var buttonIndex = 0; buttonIndex < buttons.Length; buttonIndex++)
             {
-                runningTimer = _consoleType.GetProperty("IsRunningTimer", AnyInstance)?.GetValue(_console) is bool rt && rt;
+                var button = buttons.GetValue(buttonIndex);
+                if (!TryRead(button, "IsButton", out var isButton) || isButton is not true) continue;
+                var integerValue = Required(button, "IsInteger");
+                if (integerValue is not bool) missing.Add("button.IsInteger:bool");
+                var integer = integerValue is true;
+                var raw = Convert.ToString(Required(button, integer ? "Input" : "Inputs"), CultureInfo.InvariantCulture) ?? string.Empty;
+                var gen = Convert.ToString(Required(button, "Generation"), CultureInfo.InvariantCulture);
+                var active = needValue is true && hasGeneration && gen == frame.Generation.ToString(CultureInfo.InvariantCulture);
+                frame.Buttons.Add(new ButtonInfo
+                {
+                    Id = "b-" + lineNo + "-" + buttonIndex + "-" + gen, Value = raw,
+                    Generation = gen, Label = button.ToString() ?? string.Empty, Integer = integer,
+                    Active = active, LineIndex = index, Token = ChoiceToken(gen, integer, raw),
+                });
             }
         }
-        catch { }
-
-        if (request is null)
+        if (needValue is true && frame.Buttons.Count > 0 && !hasGeneration) missing.Add("lastButtonGeneration");
+        frame.ContractValid = missing.Count == 0;
+        input["contractValid"] = frame.ContractValid;
+        if (missing.Count > 0) input["missingMembers"] = missing.Distinct(StringComparer.Ordinal).ToArray();
+        // No display positions, labels, timer countdowns, pages, colors, or window
+        // geometry enter this token. Identity also detects identical-looking requests.
+        var signature = HashParts(new[] { state, kind, id, Convert.ToString(oneValue), Convert.ToString(needValue),
+            limit.ToString(CultureInfo.InvariantCulture), Convert.ToString(systemValue), frame.ContractValid.ToString(),
+            frame.Generation.ToString(CultureInfo.InvariantCulture) }.Concat(frame.Buttons.Where(b => b.Active).Select(b => b.Token).OrderBy(x => x, StringComparer.Ordinal)));
+        if (!ReferenceEquals(request, _epochRequest) || !ReferenceEquals(_console, _epochConsole) || signature != _epochSignature)
         {
-            return new Dictionary<string, object>
-            {
-                ["kind"] = "Void",
-                ["requestId"] = "",
-                ["oneInput"] = false,
-                ["needValue"] = false,
-                ["timeLimit"] = 0L,
-                ["runningTimer"] = runningTimer,
-                ["systemInput"] = false,
-            };
+            _epochRequest = request; _epochConsole = _console; _epochSignature = signature;
+            _inputEpoch = _sessionId + ":input:" + (++_inputSerial).ToString(CultureInfo.InvariantCulture) + ":" + signature;
         }
-        var type = request.GetType();
-        return new Dictionary<string, object>
-        {
-            ["kind"] = type.GetField("InputType", AnyInstance)?.GetValue(request)?.ToString() ?? "Void",
-            ["requestId"] = Convert.ToString(type.GetField("ID", AnyInstance)?.GetValue(request), CultureInfo.InvariantCulture) ?? "",
-            ["oneInput"] = type.GetField("OneInput", AnyInstance)?.GetValue(request) is bool one && one,
-            ["needValue"] = type.GetProperty("NeedValue", AnyInstance)?.GetValue(request) is bool need && need,
-            ["timeLimit"] = Convert.ToInt64(type.GetField("Timelimit", AnyInstance)?.GetValue(request) ?? 0L, CultureInfo.InvariantCulture),
-            ["runningTimer"] = runningTimer,
-            ["systemInput"] = type.GetField("IsSystemInput", AnyInstance)?.GetValue(request) is bool sys && sys,
-        };
+        frame.Epoch = _inputEpoch;
+        var key = kind == "EnterKey" || kind == "AnyKey";
+        var supported = ValueInput(kind) || key;
+        var consistent = ValueInput(kind) ? needValue is true : key && needValue is false;
+        frame.CanAct = frame.ContractValid && consistent && state == "WaitInput" && supported && (systemValue is false || ValueInput(kind)) &&
+            (ValueInput(kind) || !timed) && frame.Epoch != _consumedEpoch;
+        frame.CanAdvance = frame.CanAct && systemValue is false && key && needValue is false && !timed && !frame.Buttons.Any(b => b.Active);
+        frame.Phase = state == "Initializing" || string.IsNullOrEmpty(state) ? "loading" :
+            state == "Error" || state == "Quit" ? "failed" : frame.CanAct ? "waiting-input" : "running";
+        frame.Reason = !frame.ContractValid ? "adapter-contract-missing" : state != "WaitInput" ? "engine-not-waiting" :
+            systemValue is true && !ValueInput(kind) ? "system-wait" : !supported ? "unsupported-input-kind" : !consistent ? "inconsistent-input-contract" : key && timed ? "timed-key-wait" :
+            frame.Epoch == _consumedEpoch ? "input-already-submitted" : "input-ready";
+        // A null request during initialization is ordinary loading, not a broken adapter.
+        if (!frame.ContractValid && request != null && state == "WaitInput") frame.Phase = "failed";
+        return frame;
     }
 
     // ---- helpers ----
@@ -1076,71 +1160,108 @@ internal static class Bridge
         return false;
     }
 
-    private static Dictionary<string, object> OnUi(Func<Dictionary<string, object>> operation)
+    private sealed class Deadline
     {
-        var wait = System.Diagnostics.Stopwatch.StartNew();
-        while (wait.ElapsedMilliseconds < 120000)
-        {
-            RefreshTargets();
-            if (_failure != null) return Error("NOT_READY", _failure);
-            if (_console != null)
-            {
-                var stateNow = _consoleType.GetProperty("state", AnyInstance)?.GetValue(_console)?.ToString();
-                if (!string.IsNullOrEmpty(stateNow) && stateNow != "Initializing") break;
-            }
-            Thread.Sleep(100);
-        }
-        if (_window is null || _window.IsDisposed) return Error("NOT_READY", _failure ?? "engine window is not ready");
-        if (_console is null) return Error("NOT_READY", "engine console is not attached yet");
-        if (string.Equals(_consoleType.GetProperty("state", AnyInstance)?.GetValue(_console)?.ToString(), "Initializing", StringComparison.Ordinal))
-        {
-            return Error("NOT_READY", "engine is still initializing; observe again in a moment");
-        }
-        Dictionary<string, object> result = null;
-        Exception failure = null;
-        var done = new ManualResetEventSlim();
-        var queuedAt = DateTime.UtcNow;
-        _window.BeginInvoke((Action)(() =>
-        {
-            try { result = operation(); }
-            catch (Exception ex) { failure = ex; }
-            finally { done.Set(); Record("ui-done", new { queuedMs = (int)(DateTime.UtcNow - queuedAt).TotalMilliseconds }); }
-        }));
-        if (!done.Wait(120000))
-        {
-            Record("ui-timeout", new { waitedMs = wait.ElapsedMilliseconds });
-            return Error("OUTCOME_UNCERTAIN", "UI operation is running; do not repeat the action");
-        }
-        if (failure != null) return Error("ENGINE_ERROR", Root(failure).Message);
-        return result;
+        private readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
+        private readonly int _budget;
+        internal Deadline(int budget) { _budget = budget; }
+        internal int Remaining => Math.Max(0, _budget - (int)_clock.ElapsedMilliseconds);
+        internal bool Expired => Remaining <= 0;
     }
 
-    // Bounded snapshot attempt used while waiting for a decision screen. Returns null
-    // when the UI thread does not answer, so the caller can try again instead of
-    // failing the whole request or blocking on a frozen idle cache.
-    private static Dictionary<string, object> TryFresh(JsonElement request, int timeoutMs)
+    private sealed class UiWork
     {
-        if (_window is null || _window.IsDisposed || _console is null) { RefreshTargets(); return null; }
-        Dictionary<string, object> result = null;
-        Exception failure = null;
-        using var done = new ManualResetEventSlim();
+        // queued / running / completed / cancelled-before-execution
+        internal int State;
+        internal readonly TaskCompletionSource<Dictionary<string, object>> Completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    private static Dictionary<string, object> OnUi(Func<Dictionary<string, object>> operation, Deadline deadline, int sliceMs = int.MaxValue)
+    {
+        if (deadline.Expired) return Error("CANCELLED_BEFORE_EXECUTION", "Request deadline expired before queuing UI work");
+        var window = _window;
+        if (window is null || window.IsDisposed || _console is null) return Error("NOT_READY", "Engine UI is not attached yet");
+        var work = new UiWork();
+        lock (UiGate)
+        {
+            // Even a cancelled callback keeps the slot until it is drained. A busy
+            // UI can therefore accumulate at most one bridge callback, not one per poll.
+            if (_uiWork != null) return Error("UI_BUSY", "A prior UI callback has not drained; observe again");
+            _uiWork = work;
+        }
+        void Release()
+        {
+            lock (UiGate) if (ReferenceEquals(_uiWork, work)) _uiWork = null;
+        }
         try
         {
-            _window.BeginInvoke((Action)(() =>
+            window.BeginInvoke((Action)(() =>
             {
-                var options = OptionsFrom(request);
-                try { result = SnapshotCore(options); }
-                catch (Exception ex) { failure = ex; }
-                finally { done.Set(); }
+                Dictionary<string, object> result;
+                if (Interlocked.CompareExchange(ref work.State, 1, 0) != 0)
+                {
+                    Release();
+                    return; // caller cancelled while this callback was still queued
+                }
+                try
+                {
+                    if (deadline.Expired)
+                    {
+                        Interlocked.Exchange(ref work.State, 3);
+                        result = Error("CANCELLED_BEFORE_EXECUTION", "Request deadline expired before UI execution");
+                    }
+                    else result = operation();
+                }
+                catch (Exception ex) { result = Error("ENGINE_ERROR", Root(ex).Message); }
+                if (Volatile.Read(ref work.State) != 3) Interlocked.Exchange(ref work.State, 2);
+                work.Completion.TrySetResult(result);
+                Release();
             }));
         }
-        catch { return null; }
-        if (!done.Wait(timeoutMs) || result is null || failure != null)
+        catch (Exception ex)
         {
-            Record("fresh-timeout", new { timeoutMs, executed = done.IsSet, error = failure?.Message });
-            return null;
+            Interlocked.Exchange(ref work.State, 3);
+            Release();
+            return Error("CANCELLED_BEFORE_EXECUTION", Root(ex).Message);
         }
-        return result;
+        var waitMs = Math.Min(deadline.Remaining, Math.Max(1, sliceMs));
+        if (waitMs > 0 && work.Completion.Task.Wait(waitMs)) return work.Completion.Task.Result;
+        if (Interlocked.CompareExchange(ref work.State, 3, 0) == 0)
+        {
+            var cancelled = Error("CANCELLED_BEFORE_EXECUTION", "UI work cancelled before execution");
+            work.Completion.TrySetResult(cancelled);
+            return cancelled;
+        }
+        if (work.Completion.Task.IsCompleted) return work.Completion.Task.Result;
+        return Error("OUTCOME_UNCERTAIN", "UI operation has started; do not repeat an input with a new actionId");
+    }
+
+    private static IEnumerable<string> SnapshotParts(InputFrame frame, IList allLines)
+    {
+        yield return frame.State;
+        yield return frame.Epoch;
+        yield return Json(frame.Input);
+        yield return frame.CanAct.ToString();
+        yield return allLines.Count.ToString(CultureInfo.InvariantCulture);
+        foreach (var line in allLines) { yield return "line"; yield return line?.ToString() ?? string.Empty; }
+        foreach (var button in frame.Buttons)
+        {
+            yield return "button"; yield return button.Id; yield return button.Generation;
+            yield return button.Value; yield return button.Integer.ToString(); yield return button.Label;
+            yield return button.Active.ToString();
+        }
+    }
+
+    private static string HashParts(IEnumerable<string> parts)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        foreach (var part in parts)
+        {
+            var bytes = Utf8.GetBytes(part ?? string.Empty);
+            hash.AppendData(BitConverter.GetBytes(bytes.Length));
+            hash.AppendData(bytes);
+        }
+        return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
     }
 
     private static void CloseWindow()
@@ -1169,12 +1290,6 @@ internal static class Bridge
     {
         while ((ex is TargetInvocationException || ex is AggregateException) && ex.InnerException != null) ex = ex.InnerException;
         return ex;
-    }
-
-    private static string Hash(string value)
-    {
-        using var sha = SHA256.Create();
-        return Convert.ToHexString(sha.ComputeHash(Utf8.GetBytes(value))).ToLowerInvariant();
     }
 
     private static void Record(string kind, object value)

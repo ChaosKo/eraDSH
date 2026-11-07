@@ -1,4 +1,33 @@
-# eraDSH 首轮实测报告
+# eraDSH 实测报告
+
+## 2026-11-08：0.3.1 三类失败修复（本轮结果）
+
+优先恢复 eraOCG 启动链路，再处理 eratohoK 加载与 eraMeiQ 连续刷新菜单；以真实游戏端到端为主要验收。
+
+| 目标 | open 耗时 | 实际走到的位置 | 证据 |
+| --- | --- | --- | --- |
+| eraOCG / .NET 8 EE+EM | 733 ms | 开始游戏 → 确认 → 故事模式 → 姓名/昵称输入阶段，4 次输入成功 | [最终记录](<runtime/regression/ocg/latest-results.json>) |
+| eratohoK / Framework 1.824 | 919 ms | 重新开始 → 幻想郷大戦剧本 → 开场叙述，4 次输入成功 | [最终记录](<runtime/regression/tohok/latest-results.json>) |
+| eraMeiQ / Framework 1.821 | 940 ms | 50 ms 刷新标题页成功选择 New Game → 模式菜单，后续配置按钮输入有效，共 4 次输入 | [最终记录](<runtime/regression/meiq/latest-results.json>) |
+
+三者均在完整独立副本运行，不复制原 Sav/Dat/Debug。最终记录均包含 `original-protected-files-unchanged` 和 `test-process-cleanup`；已交付旧请求凭证的重送被拒绝。当前已安装工具调用已关闭的隔离会话，直接返回 `phase=exited/pending=false`。0.3.1 经插件管理器重新登记安装，结果为 `application=applied`，激活警告为空。
+
+### 已证实根因与修改
+
+- **启动假阻塞**：Node 等待 PowerShell `close`，后代进程继承输出管道可使父进程已退出而工具仍不返回。最小实验：父进程 300 ms 退出，管道 3555 ms 才关。现用 [独立启动器](<bridge/DetachedLauncher.cs>) 不继承句柄，open 不再连接 IPC、不等首屏。
+- **加载误判**：附着/窗口存在不等于可输入。两套适配器输出明确生命周期和 `canAct/pending`，动作以实时 UI 请求验证，而非缓存/历史状态授权。排队超时工作可取消，已开始执行的超时仍明确标为结果未知。
+- **eraMeiQ 刷新死锁的实际原因**：动画辅助函数用 `TINPUT 50, -999, 0` 循环改变提示颜色；同一菜单的请求对象和 ID 每 50 ms 更新。仅删除字体或文本哈希字段不足以解决。Framework 对这一已证实的短周期动画输入，通过真实执行行、完整纯文本/有效选项、权威按钮代次及定时语义保持决策连续；提交后立即失效，其余场景仍严格检查请求身份。修复前 title requestId 1→9 后 act 必拒；修复后 7→15 后仍成功进入新游戏模式。
+- **历史观察授权漏洞**：Core 不再拿历史 WaitInput/按钮代替当前状态；历史只保存已交付观察到输入代次的映射，提交时重新取实时输入与按钮。
+
+### 验证范围与收敛
+
+此前完成启动层 17 项检查、Core 36 项、Framework 50 项及旧边界 12 项检查。最后的 MeiQ 连续刷新修复按用户要求，以编译和真实端到端验收为主，没有继续扩充单测矩阵。撤回了没有现场必要性、且可能影响 WinForms 初始化顺序的附着 Timer 改动。
+
+本轮没有重跑 FL/TW 所有启动器；它们共用的启动管道问题已在代码层修复，但不据此宣称所有游戏内容均验证通过。真实游戏验证只覆盖上述新游戏前段，没有验证长时游玩、全量存读档或全部图形界面。源码与工具使用见 [桥接协议](<docs/bridge-protocol.md>)。
+
+---
+
+## 历史：首轮实测报告
 
 日期：2026-11-07  
 入口：开发时由 `erabridge.config.json` 指定的 Emuera 启动器（文件中不含机器路径）  
