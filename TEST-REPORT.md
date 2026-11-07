@@ -222,8 +222,22 @@ $obs   = & .\scripts\Invoke-Bridge.ps1 -SessionFile $build.sessionFile -Action o
 
 **顺带发现**：`Emuera1822.exe`（程序集 1.822.6770.41230）在 1.821 适配器下也能启动并返回 `WaitInput`，说明所依赖的反射成员在该版本仍然存在。但对它**未做任何动作测试**，因此仍按未验证处理，不据此声称兼容。
 
-### 8.4 尚未验证的部分
+### 8.4 插件重装与端到端确认
 
-- 插件**尚未重新安装**为 `dsh-era-bridge`（旧包 `@local/dsh-era-bridge` 仍指向已删除的 `bundle/` 目录），需重新安装并确认 `era_bridge` 可用。
-- 改造后未重跑 `tests/` 中的真实链路断言（只做了 open/observe/close）。
-- 因此本节只声明“代码、包结构与引擎选择可移植且已在两种 cwd 下实测”，不声明“全部脚本与插件安装已复测”。
+旧包 `@local/dsh-era-bridge` 指向已删除的 `bundle/` 目录，因此按新结构重装：
+
+| 步骤 | 结果 |
+| --- | --- |
+| `remove_bundle @local/dsh-era-bridge` | `application: applied` |
+| `install_bundle`（目标=仓库根） | 包名 `dsh-era-bridge` 0.1.0，`application: applied`，无警告 |
+| 工具注册 | `era_bridge` 出现在当前 Agent 的工具列表 |
+| 通过工具调用 `open` | 28 行正文、4 个按钮（0/1/8/9），`WaitInput` + `IntValue` |
+| 通过工具调用 `close` | `normal_close_scheduled`，无残留进程 |
+
+说明插件已能从新的包根找到 `scripts/Invoke-Bridge.ps1`。
+
+### 8.5 仍未覆盖的部分
+
+- `tests/` 中的真实链路断言（鸣谢切换、新游戏路径）在改造后没有重跑，只做了 open/observe/close。
+- 图形面板、人工接管、DSH 权限接入仍属下一阶段，未随本次发布准备改变。
+- 因此本节只声明“代码、包结构与引擎选择可移植，且在两种工作目录下实测”，不声明“所有测试脚本已复测”。
