@@ -287,25 +287,21 @@ internal static class Bridge
                 return Json(new Dictionary<string, object> { ["ok"] = true, ["status"] = "normal_close_scheduled" });
             case "observe":
             {
+                Record("observe-request", request.GetRawText());
                 var budget = Environment.GetEnvironmentVariable("ERA_BRIDGE_READY_MS") is { Length: > 0 } ms && int.TryParse(ms, out var parsed) ? parsed : 120000;
                 var waited = System.Diagnostics.Stopwatch.StartNew();
+                // Wait on the idle-refreshed cache until the engine is in a steady input
+                // state, then build a fresh snapshot so every option is honoured.
                 while (waited.ElapsedMilliseconds < budget)
                 {
-                    var cached = CachedSnapshot();
-                    if (IsSteadySnapshot(cached))
-                    {
-                        var mode = GetString(request, "mode");
-                        var hasCustomSlice = request.TryGetProperty("fromLine", out _) ||
-                            (request.TryGetProperty("limitLines", out var ll) && ll.GetInt32() != 200);
-                        if ((string.IsNullOrEmpty(mode) || mode == "text") && !hasCustomSlice)
-                        {
-                            return Json(cached);
-                        }
-                        return Json(Snapshot(request));
-                    }
+                    if (IsSteadySnapshot(CachedSnapshot())) break;
                     Thread.Sleep(80);
                 }
-                return Json(CachedSnapshot() ?? Error("NOT_READY", "engine did not reach a steady input state in time"));
+                if (!IsSteadySnapshot(CachedSnapshot()))
+                {
+                    return Json(CachedSnapshot() ?? Error("NOT_READY", "engine did not reach a steady input state in time"));
+                }
+                return Json(Snapshot(request));
             }
             case "act":
                 return Act(request);
@@ -434,7 +430,7 @@ internal static class Bridge
 
         var mode = GetString(request, "mode") is { Length: > 0 } m ? m : "text";
         var limit = request.TryGetProperty("limitLines", out var ll) ? ll.GetInt32() : 80;
-        var after = SnapshotCore(new Dictionary<string, object> { ["mode"] = mode, ["limitLines"] = limit });
+        var after = SnapshotCore(new Dictionary<string, object> { ["mode"] = mode, ["limitLines"] = limit, ["includeLines"] = false });
         _cached = after;
         _cachedAt = DateTime.UtcNow;
 
@@ -464,7 +460,59 @@ internal static class Bridge
         };
         if (request.TryGetProperty("limitLines", out var limit)) options["limitLines"] = limit.GetInt32();
         if (request.TryGetProperty("fromLine", out var from)) options["fromLine"] = from.GetInt32();
+        if (request.TryGetProperty("includeLines", out var includeLines) &&
+            (includeLines.ValueKind == JsonValueKind.True || includeLines.ValueKind == JsonValueKind.False))
+        {
+            options["includeLines"] = includeLines.GetBoolean();
+        }
+        var noise = GetString(request, "noise");
+        if (noise.Length > 0) options["noise"] = noise;
         return OnUi(() => SnapshotCore(options));
+    }
+
+    // Era engines print a wall of loading chatter at startup. The wording is
+    // localized ("読み込み中", "读取 ABL.CSV 中", "Loading ..."), so a line counts as
+    // noise when it names a script/data file AND carries a progress word, or when it
+    // starts with a progress word outright. Counts are reported, never silent.
+    private static bool IsLoadNoise(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return false;
+        var t = text.Trim();
+        if (t.Length == 0 || t.Length > 260) return false;
+
+        var startsWithProgress =
+            t.StartsWith("読み込み", StringComparison.Ordinal) ||
+            t.StartsWith("ロード", StringComparison.Ordinal) ||
+            t.StartsWith("读取", StringComparison.Ordinal) ||
+            t.StartsWith("讀取", StringComparison.Ordinal) ||
+            t.StartsWith("加载", StringComparison.Ordinal) ||
+            t.StartsWith("載入", StringComparison.Ordinal) ||
+            t.StartsWith("Now Loading", StringComparison.OrdinalIgnoreCase) ||
+            t.StartsWith("Loading", StringComparison.OrdinalIgnoreCase);
+        if (startsWithProgress) return true;
+
+        var lower = t.ToLowerInvariant();
+        var hasFileExtension = lower.Contains(".erb") || lower.Contains(".erh") || lower.Contains(".csv");
+        if (!hasFileExtension) return false;
+
+        var hasProgressWord =
+            t.Contains("读取") || t.Contains("讀取") || t.Contains("加载") || t.Contains("載入") ||
+            t.Contains("読み込み") || t.Contains("ロード") || lower.Contains("loading");
+        var hasProgressSuffix = t.EndsWith("中・・・", StringComparison.Ordinal) ||
+                                t.EndsWith("中...", StringComparison.Ordinal) ||
+                                t.EndsWith("中…", StringComparison.Ordinal);
+        return hasProgressWord || hasProgressSuffix;
+    }
+
+    // Era screens are separated by a long run of one character; keep the fact, drop the bytes.
+    private static string CollapseSeparator(string text)
+    {
+        if (string.IsNullOrEmpty(text) || text.Length < 40) return text;
+        var t = text.TrimEnd();
+        if (t.Length < 40 || char.IsWhiteSpace(t[0])) return text;
+        var first = t[0];
+        for (var i = 1; i < t.Length; i++) if (t[i] != first) return text;
+        return first + " ×" + t.Length.ToString(CultureInfo.InvariantCulture);
     }
 
     private static Dictionary<string, object> SnapshotCore(Dictionary<string, object> options)
@@ -512,29 +560,43 @@ internal static class Bridge
         var text = new StringBuilder();
         var omittedInactive = 0;
         var omittedButtons = 0;
+        var filteredNoise = 0;
+        var collapsed = 0;
         var characterBudget = 24000;
         var textCut = false;
+        var includeLines = options.ContainsKey("includeLines") && Convert.ToBoolean(options["includeLines"], CultureInfo.InvariantCulture);
+        var filterNoise = !options.ContainsKey("noise") || !string.Equals(Convert.ToString(options["noise"]), "raw", StringComparison.OrdinalIgnoreCase);
 
         for (var index = start; index < allLines.Count && index < start + limit; index++)
         {
             var line = allLines[index];
             var lineNo = Convert.ToInt32(line?.GetType().GetField("LineNo", AnyInstance)?.GetValue(line) ?? index);
             var original = line?.ToString() ?? string.Empty;
+            if (filterNoise && IsLoadNoise(original))
+            {
+                filteredNoise++;
+                continue;
+            }
+            var display = filterNoise ? CollapseSeparator(original) : original;
+            if (!string.Equals(display, original, StringComparison.Ordinal)) collapsed++;
             if (characterBudget > 0)
             {
                 var available = Math.Max(0, characterBudget - 2);
-                var clipped = original.Length > available ? original.Substring(0, available) : original;
-                var cut = clipped.Length < original.Length;
+                var clipped = display.Length > available ? display.Substring(0, available) : display;
+                var cut = clipped.Length < display.Length;
                 text.Append(clipped).Append("\r\n");
                 characterBudget -= clipped.Length + 2;
                 textCut |= cut;
-                lines.Add(new Dictionary<string, object>
+                if (includeLines)
                 {
-                    ["index"] = index,
-                    ["lineNo"] = lineNo,
-                    ["text"] = clipped,
-                    ["truncated"] = cut,
-                });
+                    lines.Add(new Dictionary<string, object>
+                    {
+                        ["index"] = index,
+                        ["lineNo"] = lineNo,
+                        ["text"] = clipped,
+                        ["truncated"] = cut,
+                    });
+                }
             }
             else
             {
@@ -547,6 +609,7 @@ internal static class Bridge
         {
             var line = allLines[index];
             var lineNo = Convert.ToInt32(line?.GetType().GetField("LineNo", AnyInstance)?.GetValue(line) ?? index);
+            if (filterNoise && IsLoadNoise(line?.ToString() ?? string.Empty)) continue;
             var lineButtons = line?.GetType().GetProperty("Buttons", AnyInstance)?.GetValue(line) as Array;
             if (lineButtons is null) continue;
             for (var buttonIndex = 0; buttonIndex < lineButtons.Length; buttonIndex++)
@@ -609,16 +672,18 @@ internal static class Bridge
             ["input"] = input,
             ["title"] = _window?.Text ?? string.Empty,
             ["text"] = mode == "visual" ? null : text.ToString(),
-            ["lines"] = mode == "visual" ? null : lines,
+            ["lines"] = (mode == "visual" || !includeLines) ? null : lines,
             ["buttons"] = buttons,
             ["buttonGeneration"] = currentGeneration,
             ["omittedInactiveButtons"] = omittedInactive,
             ["omittedButtons"] = omittedButtons,
+            ["filteredNoiseLines"] = filteredNoise,
+            ["collapsedSeparators"] = collapsed,
             ["totalLines"] = allLines.Count,
             ["fromLine"] = start,
-            ["returnedLines"] = lines.Count,
+            ["returnedLines"] = includeLines ? lines.Count : 0,
             ["omittedBefore"] = start,
-            ["omittedAfter"] = Math.Max(0, allLines.Count - start - lines.Count),
+            ["omittedAfter"] = Math.Max(0, allLines.Count - start - limit),
             ["rawTextLength"] = text.Length,
             ["textTruncated"] = textCut,
             ["textCharacterBudget"] = 24000,
@@ -634,7 +699,6 @@ internal static class Bridge
             result["screenshot"] = Capture();
         }
         Remember(result);
-        Record("debug-snapshot", new { btnCount = ((System.Collections.Generic.List<object>)result["buttons"]).Count });
         return result;
     }
 

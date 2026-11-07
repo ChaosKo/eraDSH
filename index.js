@@ -99,6 +99,8 @@ export function apply(ctx, config = {}) {
         recreate: { type: 'boolean', description: 'build only: discard and rebuild an existing runtime directory.' },
         sessionFile: { type: 'string', description: 'Absolute path to a session.json. Falls back to the plugin configuration, then to the session this tool built last.' },
         mode: { type: 'string', enum: ['text', 'visual', 'both', 'auto'], description: 'Observation content. auto currently behaves like both.' },
+        includeLines: { type: 'boolean', description: 'Include the per-line array. It duplicates text one-for-one, so observations omit it unless this is true.' },
+        noise: { type: 'string', enum: ['filter', 'raw'], description: 'filter (default) drops engine loading chatter (読み込み/ロード/Loading lines, bare .erb/.erh/.csv listings) and collapses long separator runs, reporting counts in filteredNoiseLines and collapsedSeparators; raw returns the display buffer verbatim.' },
         limitLines: { type: 'integer', minimum: 1, maximum: 200, description: 'Maximum display-buffer lines to return.' },
         fromLine: { type: 'integer', minimum: 0, description: 'Zero-based display-buffer line to start from; omit for the newest page.' },
         observationId: { type: 'string', description: 'Observation id the action is based on. Required for act.' },
@@ -112,7 +114,9 @@ export function apply(ctx, config = {}) {
     },
     output: {
       schema: { type: 'object', additionalProperties: true },
-      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+      // Compact on purpose: pretty-printing the same observation costs about 28% more
+      // context for no information the model can use.
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
     },
     async execute(args) {
       const action = String(args.action ?? '')
@@ -150,6 +154,8 @@ export function apply(ctx, config = {}) {
       if (args.mode) cli.push('-Mode', String(args.mode))
       if (args.limitLines != null) cli.push('-LimitLines', String(args.limitLines))
       if (args.fromLine != null) cli.push('-FromLine', String(args.fromLine))
+      if (args.includeLines === true) cli.push('-IncludeLines')
+      if (args.noise) cli.push('-Noise', String(args.noise))
       if (action === 'act') {
         if (!args.observationId) throw new Error('act requires observationId from the latest observation')
         cli.push('-ObservationId', String(args.observationId))

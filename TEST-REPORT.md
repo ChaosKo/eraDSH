@@ -363,3 +363,16 @@ bundle patch 从一行扩到两行：除 `dsh-era-bridge` 外，新增一条 `@d
 | `EraMaou\eramaou_EX 0.92.exe` | .NET Framework x86 | 通过 | 28 行 / 4 按钮 | 通过 | 通过 |
 
 过程中发现一处自身回归：为加入 `engineKind` 修改 `Common.ps1` 时误删了结果对象的 `EngineAssemblyVersion`，.NET Framework 宿主因“会话未声明引擎版本”启动失败、管道超时。补回字段后 Maou 复测通过。真实存档按既有流程移出并还原。
+
+### 8.13 观察瘦身与加载噪声过滤（2026-11-07 23:00）
+
+| 改动 | 结果 |
+| --- | --- |
+| 加载噪声过滤 | `erafl` 缓冲开头 200 行加载日志中剔除 199 行（7 284 → 24 字符） |
+| 分隔线折叠 | `EraMaou` 折叠为 `- ×123`，`eraOCG2` 折叠为 `— ×156` |
+| `lines[]` 默认不下发 | `erafl` 默认观察 4.7 KB，`includeLines` 时 11.9 KB（省约 60%） |
+| `act` 精简 | 观察体约 4.3 KB，不再携带整屏逐行数组 |
+| 工具层紧凑渲染 | 去掉 pretty-print（约 1.28×） |
+| 回归 | `EraMaou` 28 行/4 按钮、`eraOCG2` 36 行/3 按钮，动作均正常 |
+
+过滤只影响呈现：`observationId` 仍按完整缓冲区计算，`noise=raw` 可取回原始文本。第一版规则漏掉了中文加载行（`ABL.CSV读取中・・・`），已补入判定。

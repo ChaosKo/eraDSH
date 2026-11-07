@@ -11,6 +11,8 @@ param(
  [string]$Value='',
  [string]$ChoiceId,
  [string]$ActionId,
+ [switch]$IncludeLines,
+ [ValidateSet('filter','raw')][string]$Noise='filter',
  [string]$OutputPath
 )
 $ErrorActionPreference='Stop'
@@ -45,6 +47,8 @@ if($Action -eq 'open') {
  [pscustomobject]@{processId=$p.Id;startTimeUtc=$p.StartTime.ToUniversalTime().ToString('o');hostPath=$settings.hostPath;sessionId=$settings.sessionId} | ConvertTo-Json | Set-Content -LiteralPath $instancePath -Encoding UTF8
 } else { $p=Assert-HostIdentity }
 $request=[ordered]@{token=$settings.token;action=$Action;mode=$Mode;limitLines=$LimitLines}
+if($IncludeLines) { $request.includeLines=$true }
+if($Noise -ne 'filter') { $request.noise=$Noise }
 if($Action -eq 'open') { $request.action='observe' }
 if($FromLine -ge 0) { $request.fromLine=$FromLine }
 if($Action -eq 'act') {

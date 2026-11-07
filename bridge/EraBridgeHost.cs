@@ -210,6 +210,37 @@ namespace EraDSH {
     stream.FlushFinalBlock();return BitConverter.ToString(sha.Hash).Replace("-","").ToLowerInvariant();
    }
   }
+  // Era engines print a wall of loading chatter at startup. The wording is localized
+  // ("読み込み中", "读取 ABL.CSV 中", "Loading ..."), so a line counts as noise when it
+  // names a script/data file AND carries a progress word, or starts with one outright.
+  static bool IsLoadNoise(string text) {
+   if(string.IsNullOrEmpty(text))return false;
+   var t=text.Trim();
+   if(t.Length==0||t.Length>260)return false;
+   if(t.StartsWith("読み込み",StringComparison.Ordinal)||t.StartsWith("ロード",StringComparison.Ordinal)||
+      t.StartsWith("读取",StringComparison.Ordinal)||t.StartsWith("讀取",StringComparison.Ordinal)||
+      t.StartsWith("加载",StringComparison.Ordinal)||t.StartsWith("載入",StringComparison.Ordinal)||
+      t.StartsWith("Now Loading",StringComparison.OrdinalIgnoreCase)||t.StartsWith("Loading",StringComparison.OrdinalIgnoreCase))return true;
+   var lower=t.ToLowerInvariant();
+   if(lower.IndexOf(".erb",StringComparison.Ordinal)<0&&lower.IndexOf(".erh",StringComparison.Ordinal)<0&&lower.IndexOf(".csv",StringComparison.Ordinal)<0)return false;
+   if(t.IndexOf("读取",StringComparison.Ordinal)>=0||t.IndexOf("讀取",StringComparison.Ordinal)>=0||
+      t.IndexOf("加载",StringComparison.Ordinal)>=0||t.IndexOf("載入",StringComparison.Ordinal)>=0||
+      t.IndexOf("読み込み",StringComparison.Ordinal)>=0||t.IndexOf("ロード",StringComparison.Ordinal)>=0||
+      lower.IndexOf("loading",StringComparison.Ordinal)>=0)return true;
+   return t.EndsWith("中・・・",StringComparison.Ordinal)||t.EndsWith("中...",StringComparison.Ordinal)||t.EndsWith("中…",StringComparison.Ordinal);
+  }
+
+  // Era screens are separated by a long run of one character; keep the fact, drop
+  // the bytes.
+  static string CollapseSeparator(string text) {
+   if(string.IsNullOrEmpty(text)||text.Length<40)return text;
+   var t=text.TrimEnd();
+   if(t.Length<40||char.IsWhiteSpace(t[0]))return text;
+   var first=t[0];
+   for(int i=1;i<t.Length;i++)if(t[i]!=first)return text;
+   return first+" ×"+t.Length.ToString(CultureInfo.InvariantCulture);
+  }
+
   static Dictionary<string,object> Snapshot(Dictionary<string,object> request) {
    int limit=I(request,"limitLines",80);if(limit<1||limit>200)throw new ArgumentOutOfRangeException("limitLines","Use 1..200");
    string mode=S(request,"mode","text");if(mode!="text"&&mode!="visual"&&mode!="both"&&mode!="auto")throw new ArgumentException("Invalid observation mode");
@@ -223,13 +254,22 @@ namespace EraDSH {
    int currentGeneration=0;
    foreach(object line in list)foreach(object b in (Array)Prop(line,"Buttons"))if((bool)Prop(b,"IsButton"))currentGeneration=Math.Max(currentGeneration,Convert.ToInt32(Prop(b,"Generation"),CultureInfo.InvariantCulture));
    bool includeInactive=request.ContainsKey("includeInactive")&&Convert.ToBoolean(request["includeInactive"],CultureInfo.InvariantCulture);
-   var lines=new List<object>();var text=new StringBuilder();var buttons=new List<object>();int omittedButtons=0;int omittedInactive=0;bool textCut=false;int characterBudget=24000;
+   // lines[] duplicates text one-for-one; act responses skip it unless the caller asks.
+   bool includeLines=request.ContainsKey("includeLines")&&Convert.ToBoolean(request["includeLines"],CultureInfo.InvariantCulture);
+   bool filterNoise=!request.ContainsKey("noise")||!string.Equals(S(request,"noise","filter"),"raw",StringComparison.OrdinalIgnoreCase);
+   var lines=new List<object>();var text=new StringBuilder();var buttons=new List<object>();int omittedButtons=0;int omittedInactive=0;int filteredNoise=0;int collapsed=0;bool textCut=false;int characterBudget=24000;
    for(int n=start;n<list.Count&&n<start+limit;n++) {
     object line=list[n];int lineNo=Convert.ToInt32(Field(line,"LineNo"));string original=line.ToString();
+    if(filterNoise&&IsLoadNoise(original)) {
+     filteredNoise++;
+     continue;
+    }
+    var display=filterNoise?CollapseSeparator(original):original;
+    if(!string.Equals(display,original,StringComparison.Ordinal))collapsed++;
     if(characterBudget>0) {
-     int available=Math.Max(0,characterBudget-2);string value=Clip(original,available);bool cut=value.Length<original.Length;
+     int available=Math.Max(0,characterBudget-2);string value=Clip(display,available);bool cut=value.Length<display.Length;
      text.Append(value);text.Append("\r\n");characterBudget-=value.Length+2;textCut|=cut;
-     lines.Add(Map("index",n,"lineNo",lineNo,"text",value,"truncated",cut));
+     if(includeLines)lines.Add(Map("index",n,"lineNo",lineNo,"text",value,"truncated",cut));
     }else textCut=true;
     var items=(Array)Prop(line,"Buttons");
     for(int j=0;j<items.Length;j++) {
@@ -243,7 +283,7 @@ namespace EraDSH {
     }
    }
    string fingerprint=ObservationHash(state,input,full,list,currentGeneration);
-   var result=Map("ok",true,"sessionId",SessionId,"observationId",SessionId+":"+fingerprint,"capturedUtc",DateTime.UtcNow.ToString("o"),"source","engine-display-buffer","consistency","same-ui-thread; animation frames are not revision-tracked","state",state,"input",input,"title",Clip(Window.Text,512),"text",mode=="visual"?null:text.ToString(),"lines",mode=="visual"?null:lines,"buttons",buttons,"buttonGeneration",currentGeneration,"omittedInactiveButtons",omittedInactive,"omittedButtons",omittedButtons,"totalLines",list.Count,"fromLine",start,"returnedLines",lines.Count,"omittedBefore",start,"omittedAfter",Math.Max(0,list.Count-start-lines.Count),"rawTextLength",full.Length,"textTruncated",textCut,"textCharacterBudget",24000,"window",Map("handle",Window.Handle.ToInt64(),"clientWidth",Window.ClientSize.Width,"clientHeight",Window.ClientSize.Height));
+   var result=Map("ok",true,"sessionId",SessionId,"observationId",SessionId+":"+fingerprint,"capturedUtc",DateTime.UtcNow.ToString("o"),"source","engine-display-buffer","consistency","same-ui-thread; animation frames are not revision-tracked","state",state,"input",input,"title",Clip(Window.Text,512),"text",mode=="visual"?null:text.ToString(),"lines",(mode=="visual"||!includeLines)?null:lines,"buttons",buttons,"buttonGeneration",currentGeneration,"omittedInactiveButtons",omittedInactive,"omittedButtons",omittedButtons,"filteredNoiseLines",filteredNoise,"collapsedSeparators",collapsed,"totalLines",list.Count,"fromLine",start,"returnedLines",includeLines?lines.Count:0,"omittedBefore",start,"omittedAfter",Math.Max(0,list.Count-start-limit),"rawTextLength",full.Length,"textTruncated",textCut,"textCharacterBudget",24000,"window",Map("handle",Window.Handle.ToInt64(),"clientWidth",Window.ClientSize.Width,"clientHeight",Window.ClientSize.Height));
    if(mode=="visual"||mode=="both"||mode=="auto")result["screenshot"]=Capture();
    return result;
   }
@@ -279,7 +319,7 @@ namespace EraDSH {
    if(kind!="continue"&&inputKind!="IntValue"&&inputKind!="StrValue")return Error("WRONG_INPUT_KIND","Use continue for key waits");
    // Exact verified signature, dispatched on the engine UI thread. No window focus required.
    Call(ConsoleObject,"PressEnterKey",new Type[]{typeof(bool),typeof(string),typeof(bool)},false,value,false);
-   var after=Snapshot(Map("mode",S(request,"mode","text"),"limitLines",80));
+   var after=Snapshot(Map("mode",S(request,"mode","text"),"limitLines",80,"includeLines",false));
    return Map("ok",true,"actionId",S(request,"actionId"),"submitted",true,"value",value,"observationChanged",S(after,"observationId")!=S(current,"observationId"),"observation",after);
   }
  }
