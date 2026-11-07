@@ -411,3 +411,15 @@ bundle patch 从一行扩到两行：除 `dsh-era-bridge` 外，新增一条 `@d
 | `eraOCG2` / `eratw` 菜单页 | `steps=0`、`stoppedBecause=input-required`，不会误点按钮 |
 
 整个过程在一次调用内完成，避免每段剧情一次往返。
+
+### 8.17 重装插件与文档重构（2026-11-08 00:05）
+
+| 检查 | 结果 |
+| --- | --- |
+| `remove_bundle dsh-era-bridge` | `application: applied` |
+| `install_bundle`（目标=仓库根） | `application: applied`，版本 0.2.0，`link:C:/Data/Game/Eras/eraDSH` |
+| 行注册 | `dsh-era-bridge` 与 `preset-era` 均在，`Config` 可见 `include:preset-era` |
+
+文档：README 收缩为面向使用者的一页（能力、依赖、`dsh plugin add github:ChaosKo/eraDSH` 安装、三分钟上手、配置与索引），技术内容拆到新增的 [docs/architecture.md](docs/architecture.md)（组件、两种宿主、协议字段、错误码、限额）与 [docs/engine-detection.md](docs/engine-detection.md)（引擎分类与选择顺序、运行时要求）。README 旧锚点 `#两种运行方式` 已不存在，`docs/observation-cost.md` 中的链接改指 architecture。
+
+说明：GitHub 安装路径按 `dsh plugin` 行为（转发 pnpm，启动时自动登记声明了 `dsh.bundle` 的新依赖）写入文档，未在本机实际执行，以免替换当前的本地链接安装。
