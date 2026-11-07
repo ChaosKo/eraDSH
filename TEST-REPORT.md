@@ -238,6 +238,24 @@ $obs   = & .\scripts\Invoke-Bridge.ps1 -SessionFile $build.sessionFile -Action o
 
 ### 8.5 仍未覆盖的部分
 
-- `tests/` 中的真实链路断言（鸣谢切换、新游戏路径）在改造后没有重跑，只做了 open/observe/close。
+- `tests/` 中的真实链路断言已在目录迁移后复测通过（见 8.6）；它们只对当前游戏版本的菜单成立，换游戏不适用。
 - 图形面板、人工接管、DSH 权限接入仍属下一阶段，未随本次发布准备改变。
-- 因此本节只声明“代码、包结构与引擎选择可移植，且在两种工作目录下实测”，不声明“所有测试脚本已复测”。
+- 因此本节声明的是“代码、包结构、引擎选择与两条游戏链路在迁移后的目录上可用”，不声明兼容其他游戏或其他引擎版本。
+
+### 8.6 目录迁移后的复测（2026-11-07 21:07–21:12）
+
+仓库从 `EraMaou0.92+EX2.2\eraDSH` 整体迁移到 `Eras\eraDSH`（插件开发目录独立于游戏目录）。迁移后工作目录就是仓库本身，不再是游戏目录，因此构建改用显式 `-GameRoot`：
+
+| 检查 | 结果 |
+| --- | --- |
+| 仓库位置与状态 | `.git` 已在 `Eras\eraDSH`；`main` 与 `origin/main` 一致，32 个文件，工作区干净 |
+| 插件注册 | profile 中 `dsh-era-bridge` 为 `link:C:/Data/Game/Eras/eraDSH`，`era_bridge` 工具正常加载 |
+| 构建（cwd=仓库根 + `-GameRoot`） | 通过；`gameRootSource=parameter`、`engineSource=detected`，引擎 SHA-256 与迁移前一致 |
+| 工具级 open → close | 28 行正文、4 个按钮（0/1/8/9）、`WaitInput` + `IntValue`；`normal_close_scheduled`，无残留进程 |
+| `Test-TitleCredits.ps1` | 13 项断言全部通过：鸣谢展开/收起、重复动作与等价 GUID 拒绝、旧观察拒绝、分页、输入类型守卫、调试输入拒绝、恢复 |
+| `Test-NewGamePath.ps1` | 10 项断言全部通过；主界面 21 个活动按钮，日期行正常 |
+| 原游戏目录 | 6 个存档与 `emuera.log`、`emuera.config` 的 mtime 均未变 |
+
+迁移后遗留 `runtime/maou-1821/`：旧的默认目录名对应的隔离副本，含上一轮产生的隔离存档。它已被忽略、不再被新构建引用，需要时可删除。
+
+环境侧记录：迁移完成后 DSH 沙箱无法在新目录上建立写授权（缺少取得所有权权限），该会话内的工具调用全部失败，与仓库内容无关；修复目录权限后原操作恢复正常，本节复测即在其后完成。
