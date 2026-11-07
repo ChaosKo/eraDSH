@@ -82,6 +82,14 @@ DSH AI / PowerShell 调用者
 
 因此一个目录里同时存在 `Emuera1822.exe`（1.822）与游戏自带的旧启动器时，会优先选中已验证的旧版，不会误用新版。
 
+> **兼容性边界**：适配器用反射加载引擎，只支持 **.NET Framework** 血统的 Emuera。Emuera.NET / Lazyloading EE 等 **.NET (Core) 单文件发布**的变体无法加载（exe 内没有 CLR 头），会被识别为 `core` 并给出说明。先用只读探针看清单：
+>
+> ```powershell
+> .\scripts\Get-EraDshEngines.ps1 -GameRoot 'D:\Games\SomeEraGame'
+> ```
+>
+> 实测矩阵与演进计划见 [`docs/engine-compatibility.md`](docs/engine-compatibility.md)。
+
 ### 需要指定路径时
 
 ```powershell
@@ -239,6 +247,7 @@ artifacts/bridge-*/   会话信息、观察、截图、审计、测试结果
 - [`PLAN.md`](PLAN.md) — 策划案与阶段划分
 - [`TEST-REPORT.md`](TEST-REPORT.md) — 实测报告、失败记录与更正
 - [`docs/observation-cost.md`](docs/observation-cost.md) — 显示缓冲、返回体与落盘成本实测
+- [`docs/engine-compatibility.md`](docs/engine-compatibility.md) — 引擎形态矩阵与 .NET Core 变体的演进计划
 - [`legacy/README.md`](legacy/README.md) — 历史探针说明
 - [`tests/README.md`](tests/README.md) — 测试脚本说明
 

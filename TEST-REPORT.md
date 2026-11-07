@@ -313,3 +313,24 @@ bundle patch 从一行扩到两行：除 `dsh-era-bridge` 外，新增一条 `@d
 
 验证环境：22 MB 临时副本（`_tool-test`），验证后删除；`runtime/host` 一并清理，下次构建重新生成。版本号升至 0.2.0，运行目录标记同步。
 
+### 8.10 多引擎兼容性（2026-11-07 21:50–22:10）
+
+对四个 Era 目录做只读检查（不启动游戏），结果见 [docs/engine-compatibility.md](docs/engine-compatibility.md)。核心结论：兼容性瓶颈是**运行时形态**，不是程序集名。
+
+| 目录 | 引擎 | 形态 | 结果 |
+| --- | --- | --- | --- |
+| `EraMaou0.92+EX2.2` | `eramaou_EX 0.92.exe` | .NET Framework x86 1.821 | 可驱动（已验证） |
+| `eraOCG2_20261009` | `Emuera.NET 1824+…EEv52fix.exe` | .NET Core 单文件 x64 | 不支持 |
+| `erafl` | `Emuera.exe` | .NET Core 单文件 x64 | 不支持 |
+| `eratw-sub-modding-main` | 四个 EE/NAudio 变体 | .NET Core 单文件 x64/x86 | 不支持 |
+
+判定手段：PE 的 CLR 头、`AssemblyName.GetAssemblyName`、`hostfxr` / `.NETCoreApp` 字符串、`BSJB` 元数据计数。
+
+修复：
+
+- 检测从"找不到引擎"改为四类分类（framework / core / native / managed-other），并在没有可用引擎时列出每个 exe 的形态与原因；
+- 显式指定 .NET Core 引擎时给出"无法被反射加载"的说明，而不是"不是 .NET 程序集"；
+- 新增只读探针 `scripts/Get-EraDshEngines.ps1`。
+
+未解决（列入计划）：这批变体的托管程序集未压缩地嵌在 exe 里（`BSJB` 16–25 次、无 `System.Private.CoreLib`），理论上可解包；但成员表已变（`Emuera.UI` 命名空间、无 `GetDisplayStrings`），需要新宿主 + 新成员映射，见计划 P2。
+

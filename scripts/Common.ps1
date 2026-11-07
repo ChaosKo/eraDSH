@@ -31,6 +31,9 @@ $script:EraDshTestedEngineVersions = @('1.821.5843.38796')
 
 # The assembly name every Emuera build uses. The host rejects anything else.
 $script:EraDshEngineAssemblyName = 'Emuera'
+# Namespace marker used only to tell a .NET Core single-file Emuera variant apart
+# from an unrelated native executable; it is never loaded or trusted.
+$script:EraDshEngineNamespace = 'MinorShift.Emuera'
 
 function Get-EraDshRepositoryRoot { return $script:EraDshRepositoryRoot }
 
@@ -103,23 +106,75 @@ function New-EraDshSetupMessage {
  return ($lines -join [Environment]::NewLine)
 }
 
-# Lists the Emuera engines directly inside a folder. Only the top level is
-# scanned: every Emuera build keeps its launcher next to CSV/ERB/resources.
+function New-EraDshUnsupportedEngineMessage {
+ param([string]$Path,[string]$Kind)
+ $lines = New-Object System.Collections.Generic.List[string]
+ [void]$lines.Add('engineExecutable is a ' + (Get-EraDshEngineKindLabel -Kind $Kind) + ': ' + $Path)
+ [void]$lines.Add('')
+ [void]$lines.Add('This adapter loads the engine as a .NET Framework assembly and reflects into it.')
+ [void]$lines.Add('A .NET Core build cannot be loaded that way, so it cannot be driven here.')
+ [void]$lines.Add('')
+ [void]$lines.Add('Options:')
+ [void]$lines.Add('  1. use the .NET Framework build of the same game, if it ships one')
+ [void]$lines.Add('  2. keep the .NET Core build for normal play; this bridge cannot automate it yet')
+ [void]$lines.Add('')
+ [void]$lines.Add('See docs/engine-compatibility.md for the tested matrix.')
+ return ($lines -join [Environment]::NewLine)
+}
+
+# Classifies an executable without running it:
+#   framework - a .NET Framework assembly this adapter can load by reflection
+#   core      - a .NET (Core) build, usually published as a single-file bundle;
+#               it has no loadable CLR header in the .exe, so reflection cannot reach it
+#   native    - anything else (plain native launcher, updater tool, ...)
+# A .NET Core single-file bundle carries the CoreCLR hosting strings and the
+# Emuera namespace inside the file, which is what distinguishes it from a random
+# native executable.
+function Get-EraDshEngineKind {
+ param([string]$Path)
+ $assemblyName = $null
+ try { $assemblyName = [Reflection.AssemblyName]::GetAssemblyName($Path) } catch { $assemblyName = $null }
+ if ($null -ne $assemblyName) {
+  if ($assemblyName.Name -eq $script:EraDshEngineAssemblyName) { return 'framework' }
+  return 'managed-other'
+ }
+ try {
+  $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($Path))
+  if ($text.IndexOf('hostfxr', [StringComparison]::Ordinal) -ge 0 -and
+      $text.IndexOf($script:EraDshEngineNamespace, [StringComparison]::Ordinal) -ge 0) { return 'core' }
+ } catch { return 'unreadable' }
+ return 'native'
+}
+
+function Get-EraDshEngineKindLabel {
+ param([string]$Kind)
+ switch ($Kind) {
+  'framework' { return 'NET Framework Emuera (supported)' }
+  'core' { return '.NET Core single-file build (not loadable by reflection)' }
+  'managed-other' { return 'managed .NET assembly, but not an Emuera build' }
+  'unreadable' { return 'unreadable file' }
+  default { return 'native executable (not the engine this adapter drives)' }
+ }
+}
+
+# Lists every executable directly inside a folder, classified. Only the top level
+# is scanned: every Emuera build keeps its launcher next to CSV/ERB/resources.
 function Get-EraDshEngineCandidates {
  param([string]$GameRoot)
  $candidates = @()
  foreach ($file in Get-ChildItem -LiteralPath $GameRoot -File -Filter '*.exe' -ErrorAction SilentlyContinue) {
+  $kind = Get-EraDshEngineKind -Path $file.FullName
   $assemblyName = $null
-  try { $assemblyName = [Reflection.AssemblyName]::GetAssemblyName($file.FullName) } catch { continue }
-  if ($null -eq $assemblyName) { continue }
-  if ($assemblyName.Name -ne $script:EraDshEngineAssemblyName) { continue }
-  $version = $assemblyName.Version.ToString()
+  try { $assemblyName = [Reflection.AssemblyName]::GetAssemblyName($file.FullName) } catch { $assemblyName = $null }
+  $version = if ($null -ne $assemblyName -and $null -ne $assemblyName.Version) { $assemblyName.Version.ToString() } else { '' }
   $candidates += [pscustomobject]@{
    Path = $file.FullName
    FileName = $file.Name
-   AssemblyName = $assemblyName.Name
+   Kind = $kind
+   KindLabel = (Get-EraDshEngineKindLabel -Kind $kind)
+   AssemblyName = if ($null -ne $assemblyName) { $assemblyName.Name } else { '' }
    Version = $version
-   Tested = ($script:EraDshTestedEngineVersions -contains $version)
+   Tested = ($null -ne $assemblyName -and $assemblyName.Name -eq $script:EraDshEngineAssemblyName -and $script:EraDshTestedEngineVersions -contains $version)
   }
  }
  return $candidates
@@ -127,7 +182,7 @@ function Get-EraDshEngineCandidates {
 
 function Format-EraDshEngineList {
  param([object[]]$Candidates)
- return (($Candidates | ForEach-Object { '  ' + $_.FileName + ' (' + $_.AssemblyName + ' ' + $_.Version + ')' }) -join [Environment]::NewLine)
+ return (($Candidates | ForEach-Object { '  ' + $_.FileName + ' - ' + $_.KindLabel }) -join [Environment]::NewLine)
 }
 
 function Get-EraDshSettings {
@@ -174,10 +229,17 @@ function Get-EraDshSettings {
   if (-not (Test-Path -LiteralPath $enginePath -PathType Leaf)) {
    throw (New-EraDshSetupMessage -ConfigPath $resolvedConfigPath -Reason ('engineExecutable does not exist: ' + $enginePath))
   }
-  try { $engineIdentity = [Reflection.AssemblyName]::GetAssemblyName($enginePath) }
-  catch { throw ('engineExecutable is not a .NET assembly: ' + $enginePath) }
+  $engineKind = Get-EraDshEngineKind -Path $enginePath
+  if ($engineKind -eq 'core') {
+   throw (New-EraDshUnsupportedEngineMessage -Path $enginePath -Kind $engineKind)
+  }
+  if ($engineKind -eq 'native' -or $engineKind -eq 'unreadable') {
+   throw ('engineExecutable is not a managed .NET assembly (' + $engineKind + '): ' + $enginePath + '.' + [Environment]::NewLine +
+     'This adapter loads the engine by reflection and only drives .NET Framework Emuera builds; see docs/engine-compatibility.md.')
+  }
+  $engineIdentity = [Reflection.AssemblyName]::GetAssemblyName($enginePath)
   if ($engineIdentity.Name -ne $script:EraDshEngineAssemblyName) {
-   throw ('engineExecutable is not an Emuera build (' + $engineIdentity.Name + '): ' + $enginePath)
+   throw ('engineExecutable is a .NET assembly but not an Emuera build (' + $engineIdentity.Name + '): ' + $enginePath)
   }
   $engineVersion = $engineIdentity.Version.ToString()
   $engineVerified = ($script:EraDshTestedEngineVersions -contains $engineVersion)
@@ -191,9 +253,15 @@ function Get-EraDshSettings {
    }
   }
  } else {
-  $candidates = @(Get-EraDshEngineCandidates -GameRoot $gameRootPath)
+  $discovered = @(Get-EraDshEngineCandidates -GameRoot $gameRootPath)
+  $candidates = @($discovered | Where-Object { $_.Kind -eq 'framework' })
   if ($candidates.Count -eq 0) {
-   throw (New-EraDshSetupMessage -ConfigPath $resolvedConfigPath -Reason ('No Emuera engine found in ' + $gameRootPath + '.'))
+   if ($discovered.Count -gt 0) {
+    throw ('No supported Emuera engine found in ' + $gameRootPath + '. Executables present:' + [Environment]::NewLine +
+      (Format-EraDshEngineList $discovered) + [Environment]::NewLine + [Environment]::NewLine +
+      'This adapter loads the engine by reflection, so it only drives .NET Framework Emuera builds. A .NET Core single-file build keeps its assemblies inside the executable and cannot be loaded that way. See docs/engine-compatibility.md.')
+   }
+   throw (New-EraDshSetupMessage -ConfigPath $resolvedConfigPath -Reason ('No executable found in ' + $gameRootPath + '.'))
   }
   $tested = @($candidates | Where-Object { $_.Tested })
   if ($tested.Count -eq 1) {
