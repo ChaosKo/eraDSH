@@ -12,6 +12,7 @@ param(
  [string]$ChoiceId,
  [string]$ActionId,
  [switch]$IncludeLines,
+ [string]$SinceObservationId,
  [ValidateSet('filter','raw')][string]$Noise='filter',
  [string]$OutputPath
 )
@@ -48,6 +49,7 @@ if($Action -eq 'open') {
 } else { $p=Assert-HostIdentity }
 $request=[ordered]@{token=$settings.token;action=$Action;mode=$Mode;limitLines=$LimitLines}
 if($IncludeLines) { $request.includeLines=$true }
+if($SinceObservationId) { $request.sinceObservationId=$SinceObservationId }
 if($Noise -ne 'filter') { $request.noise=$Noise }
 if($Action -eq 'open') { $request.action='observe' }
 if($FromLine -ge 0) { $request.fromLine=$FromLine }

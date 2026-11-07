@@ -467,6 +467,8 @@ internal static class Bridge
         }
         var noise = GetString(request, "noise");
         if (noise.Length > 0) options["noise"] = noise;
+        var since = GetString(request, "sinceObservationId");
+        if (since.Length > 0) options["since"] = since;
         return OnUi(() => SnapshotCore(options));
     }
 
@@ -558,6 +560,8 @@ internal static class Bridge
         var lines = new List<object>();
         var buttons = new List<object>();
         var text = new StringBuilder();
+        var displayed = new List<string>();
+        var displayedIndex = new List<int>();
         var omittedInactive = 0;
         var omittedButtons = 0;
         var filteredNoise = 0;
@@ -579,6 +583,8 @@ internal static class Bridge
             }
             var display = filterNoise ? CollapseSeparator(original) : original;
             if (!string.Equals(display, original, StringComparison.Ordinal)) collapsed++;
+            displayed.Add(display);
+            displayedIndex.Add(index);
             if (characterBudget > 0)
             {
                 var available = Math.Max(0, characterBudget - 2);
@@ -698,6 +704,12 @@ internal static class Bridge
         {
             result["screenshot"] = Capture();
         }
+        var since = options.ContainsKey("since") ? Convert.ToString(options["since"]) : string.Empty;
+        if (!string.IsNullOrEmpty(since))
+        {
+            ApplyDelta(result, since, displayed, displayedIndex);
+        }
+        RememberHistory(Convert.ToString(result["observationId"]), displayed);
         Remember(result);
         return result;
     }
@@ -743,6 +755,89 @@ internal static class Bridge
             ["method"] = "PrintWindow",
             ["visualValidity"] = "requires-viewing",
         };
+    }
+
+    // ---- incremental observations ----
+    //
+    // A caller that already has an observation can ask for the difference instead of
+    // the whole screen. The comparison runs over the lines as they were delivered
+    // (after filtering and separator collapsing), so the indices match what the caller
+    // saw; the observation id still hashes the whole buffer, so a delta never weakens
+    // the stale-check for actions.
+    private static readonly Dictionary<string, List<string>> DeltaHistory = new();
+    private static readonly Queue<string> DeltaOrder = new();
+
+    private static void RememberHistory(string id, List<string> displayed)
+    {
+        if (string.IsNullOrEmpty(id)) return;
+        lock (DeltaHistory)
+        {
+            if (!DeltaHistory.ContainsKey(id)) DeltaOrder.Enqueue(id);
+            DeltaHistory[id] = new List<string>(displayed);
+            while (DeltaOrder.Count > 8) DeltaHistory.Remove(DeltaOrder.Dequeue());
+        }
+    }
+
+    private static void ApplyDelta(Dictionary<string, object> result, string since, List<string> displayed, List<int> displayedIndex)
+    {
+        var delta = new Dictionary<string, object>();
+        List<string> previous;
+        var known = false;
+        lock (DeltaHistory) known = DeltaHistory.TryGetValue(since, out previous);
+
+        if (!known)
+        {
+            delta["kind"] = "full";
+            delta["sinceMissing"] = true;
+            result["delta"] = delta;
+            return;
+        }
+
+        var common = 0;
+        while (common < previous.Count && common < displayed.Count && string.Equals(previous[common], displayed[common], StringComparison.Ordinal))
+        {
+            common++;
+        }
+
+        if (common == previous.Count && common == displayed.Count)
+        {
+            delta["kind"] = "none";
+            result["text"] = null;
+            result["lines"] = null;
+            result["delta"] = delta;
+            return;
+        }
+
+        var kind = common == previous.Count ? "append" : "changed";
+        var tail = displayed.Count - common;
+        const int cap = 200;
+        if (tail > cap)
+        {
+            // Too much to send as a delta; the full text is already in the result.
+            delta["kind"] = "full";
+            delta["reason"] = "delta exceeds " + cap + " lines";
+            result["delta"] = delta;
+            return;
+        }
+
+        var appended = new List<object>();
+        for (var i = common; i < displayed.Count; i++)
+        {
+            appended.Add(new Dictionary<string, object>
+            {
+                ["index"] = displayedIndex[i],
+                ["text"] = displayed[i],
+            });
+        }
+
+        delta["kind"] = kind;
+        delta["fromIndex"] = displayedIndex.Count > common ? displayedIndex[common] : -1;
+        delta["fromOrdinal"] = common;
+        delta["removed"] = kind == "changed" ? previous.Count - common : 0;
+        delta["lines"] = appended;
+        result["delta"] = delta;
+        result["text"] = null;
+        result["lines"] = null;
     }
 
     private static void Remember(Dictionary<string, object> snapshot)

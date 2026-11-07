@@ -376,3 +376,15 @@ bundle patch 从一行扩到两行：除 `dsh-era-bridge` 外，新增一条 `@d
 | 回归 | `EraMaou` 28 行/4 按钮、`eraOCG2` 36 行/3 按钮，动作均正常 |
 
 过滤只影响呈现：`observationId` 仍按完整缓冲区计算，`noise=raw` 可取回原始文本。第一版规则漏掉了中文加载行（`ABL.CSV读取中・・・`），已补入判定。
+
+### 8.14 增量观察（2026-11-07 23:20）
+
+`observe` 新增 `sinceObservationId`：返回 `delta.kind`（`append`/`changed`/`none`/`full`）加差异行，而不是整屏。两个宿主都实现，比较的是过滤后的实际行序列，`observationId` 仍按完整缓冲区计算。
+
+| 游戏 | 全文 | 增量（动作后） | 增量（同一画面） |
+| --- | --- | --- | --- |
+| `erafl` | 2 811 B | 2 165 B `append` 8 行 | 1 727 B `none` |
+| `EraMaou` | 2 193 B | 2 144 B `changed` 7 行 | 1 586 B `none` |
+| `eraOCG2` | 1 913 B | 1 478 B `append` 5 行 | 1 266 B `none` |
+
+基线未知时返回 `full` + `sinceMissing`，不会让调用方卡在“不知道前面是什么”的状态。

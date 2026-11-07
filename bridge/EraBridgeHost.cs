@@ -241,6 +241,53 @@ namespace EraDSH {
    return first+" ×"+t.Length.ToString(CultureInfo.InvariantCulture);
   }
 
+  // ---- incremental observations ----
+  // A caller that already holds an observation can ask for the difference. The
+  // comparison runs over the lines as delivered (filtering already applied), so the
+  // indices match what the caller saw; the observation id still hashes the whole
+  // buffer, so a delta never weakens the stale check for actions.
+  static readonly Dictionary<string,List<string>> DeltaHistory=new Dictionary<string,List<string>>();
+  static readonly Queue<string> DeltaOrder=new Queue<string>();
+
+  static void RememberHistory(string id,List<string> displayed) {
+   if(string.IsNullOrEmpty(id))return;
+   lock(DeltaHistory) {
+    if(!DeltaHistory.ContainsKey(id))DeltaOrder.Enqueue(id);
+    DeltaHistory[id]=new List<string>(displayed);
+    while(DeltaOrder.Count>8)DeltaHistory.Remove(DeltaOrder.Dequeue());
+   }
+  }
+
+  static List<object> DeltaLines(List<string> displayed,List<int> indices,int fromOrdinal) {
+   var list=new List<object>();
+   for(int i=fromOrdinal;i<displayed.Count;i++)list.Add(Map("index",indices[i],"text",displayed[i]));
+   return list;
+  }
+
+  static void ApplyDelta(Dictionary<string,object> result,string since,List<string> displayed,List<int> indices) {
+   var delta=new Dictionary<string,object>();
+   List<string> previous=null;
+   lock(DeltaHistory)DeltaHistory.TryGetValue(since,out previous);
+   if(previous==null) {
+    delta["kind"]="full";delta["sinceMissing"]=true;result["delta"]=delta;return;
+   }
+   int common=0;
+   while(common<previous.Count&&common<displayed.Count&&string.Equals(previous[common],displayed[common],StringComparison.Ordinal))common++;
+   if(common==previous.Count&&common==displayed.Count) {
+    delta["kind"]="none";result["text"]=null;result["lines"]=null;result["delta"]=delta;return;
+   }
+   int tail=displayed.Count-common;
+   if(tail>200) {
+    delta["kind"]="full";delta["reason"]="delta exceeds 200 lines";result["delta"]=delta;return;
+   }
+   delta["kind"]=common==previous.Count?"append":"changed";
+   delta["fromOrdinal"]=common;
+   delta["fromIndex"]=common<indices.Count?indices[common]:-1;
+   delta["removed"]=common==previous.Count?0:previous.Count-common;
+   delta["lines"]=DeltaLines(displayed,indices,common);
+   result["delta"]=delta;result["text"]=null;result["lines"]=null;
+  }
+
   static Dictionary<string,object> Snapshot(Dictionary<string,object> request) {
    int limit=I(request,"limitLines",80);if(limit<1||limit>200)throw new ArgumentOutOfRangeException("limitLines","Use 1..200");
    string mode=S(request,"mode","text");if(mode!="text"&&mode!="visual"&&mode!="both"&&mode!="auto")throw new ArgumentException("Invalid observation mode");
@@ -258,6 +305,7 @@ namespace EraDSH {
    bool includeLines=request.ContainsKey("includeLines")&&Convert.ToBoolean(request["includeLines"],CultureInfo.InvariantCulture);
    bool filterNoise=!request.ContainsKey("noise")||!string.Equals(S(request,"noise","filter"),"raw",StringComparison.OrdinalIgnoreCase);
    var lines=new List<object>();var text=new StringBuilder();var buttons=new List<object>();int omittedButtons=0;int omittedInactive=0;int filteredNoise=0;int collapsed=0;bool textCut=false;int characterBudget=24000;
+   var displayed=new List<string>();var displayedIndex=new List<int>();
    for(int n=start;n<list.Count&&n<start+limit;n++) {
     object line=list[n];int lineNo=Convert.ToInt32(Field(line,"LineNo"));string original=line.ToString();
     if(filterNoise&&IsLoadNoise(original)) {
@@ -266,6 +314,7 @@ namespace EraDSH {
     }
     var display=filterNoise?CollapseSeparator(original):original;
     if(!string.Equals(display,original,StringComparison.Ordinal))collapsed++;
+    displayed.Add(display);displayedIndex.Add(n);
     if(characterBudget>0) {
      int available=Math.Max(0,characterBudget-2);string value=Clip(display,available);bool cut=value.Length<display.Length;
      text.Append(value);text.Append("\r\n");characterBudget-=value.Length+2;textCut|=cut;
@@ -285,6 +334,11 @@ namespace EraDSH {
    string fingerprint=ObservationHash(state,input,full,list,currentGeneration);
    var result=Map("ok",true,"sessionId",SessionId,"observationId",SessionId+":"+fingerprint,"capturedUtc",DateTime.UtcNow.ToString("o"),"source","engine-display-buffer","consistency","same-ui-thread; animation frames are not revision-tracked","state",state,"input",input,"title",Clip(Window.Text,512),"text",mode=="visual"?null:text.ToString(),"lines",(mode=="visual"||!includeLines)?null:lines,"buttons",buttons,"buttonGeneration",currentGeneration,"omittedInactiveButtons",omittedInactive,"omittedButtons",omittedButtons,"filteredNoiseLines",filteredNoise,"collapsedSeparators",collapsed,"totalLines",list.Count,"fromLine",start,"returnedLines",includeLines?lines.Count:0,"omittedBefore",start,"omittedAfter",Math.Max(0,list.Count-start-limit),"rawTextLength",full.Length,"textTruncated",textCut,"textCharacterBudget",24000,"window",Map("handle",Window.Handle.ToInt64(),"clientWidth",Window.ClientSize.Width,"clientHeight",Window.ClientSize.Height));
    if(mode=="visual"||mode=="both"||mode=="auto")result["screenshot"]=Capture();
+   if(request.ContainsKey("sinceObservationId")) {
+    var since=Convert.ToString(request["sinceObservationId"]);
+    if(!string.IsNullOrEmpty(since))ApplyDelta(result,since,displayed,displayedIndex);
+   }
+   RememberHistory(Convert.ToString(result["observationId"]),displayed);
    return result;
   }
   static object Capture() {

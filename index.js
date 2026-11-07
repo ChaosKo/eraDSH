@@ -100,6 +100,7 @@ export function apply(ctx, config = {}) {
         sessionFile: { type: 'string', description: 'Absolute path to a session.json. Falls back to the plugin configuration, then to the session this tool built last.' },
         mode: { type: 'string', enum: ['text', 'visual', 'both', 'auto'], description: 'Observation content. auto currently behaves like both.' },
         includeLines: { type: 'boolean', description: 'Include the per-line array. It duplicates text one-for-one, so observations omit it unless this is true.' },
+        sinceObservationId: { type: 'string', description: 'Incremental observe: pass the observation id you already hold and the reply carries only the difference (delta.kind = append/changed/none, or full when the base is unknown or too large). The observation id still hashes the whole screen, so actions remain safe.' },
         noise: { type: 'string', enum: ['filter', 'raw'], description: 'filter (default) drops engine loading chatter (読み込み/ロード/Loading lines, bare .erb/.erh/.csv listings) and collapses long separator runs, reporting counts in filteredNoiseLines and collapsedSeparators; raw returns the display buffer verbatim.' },
         limitLines: { type: 'integer', minimum: 1, maximum: 200, description: 'Maximum display-buffer lines to return.' },
         fromLine: { type: 'integer', minimum: 0, description: 'Zero-based display-buffer line to start from; omit for the newest page.' },
@@ -155,6 +156,7 @@ export function apply(ctx, config = {}) {
       if (args.limitLines != null) cli.push('-LimitLines', String(args.limitLines))
       if (args.fromLine != null) cli.push('-FromLine', String(args.fromLine))
       if (args.includeLines === true) cli.push('-IncludeLines')
+      if (args.sinceObservationId) cli.push('-SinceObservationId', String(args.sinceObservationId))
       if (args.noise) cli.push('-Noise', String(args.noise))
       if (action === 'act') {
         if (!args.observationId) throw new Error('act requires observationId from the latest observation')
