@@ -13,6 +13,7 @@ param(
  [string]$ActionId,
  [switch]$IncludeLines,
  [string]$SinceObservationId,
+ [long]$SinceCursor = -1,
  [ValidateSet('filter','raw')][string]$Noise='filter',
  [string]$OutputPath
 )
@@ -50,6 +51,7 @@ if($Action -eq 'open') {
 $request=[ordered]@{token=$settings.token;action=$Action;mode=$Mode;limitLines=$LimitLines}
 if($IncludeLines) { $request.includeLines=$true }
 if($SinceObservationId) { $request.sinceObservationId=$SinceObservationId }
+if($SinceCursor -ge 0) { $request.sinceCursor=$SinceCursor }
 if($Noise -ne 'filter') { $request.noise=$Noise }
 if($Action -eq 'open') { $request.action='observe' }
 if($FromLine -ge 0) { $request.fromLine=$FromLine }

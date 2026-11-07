@@ -297,6 +297,18 @@ namespace EraDSH {
    var input=Map("kind",req==null?"Void":Convert.ToString(Field(req,"InputType")),"requestId",req==null?"":Convert.ToString(Field(req,"ID"),CultureInfo.InvariantCulture),"oneInput",req!=null&&(bool)Field(req,"OneInput"),"needValue",req!=null&&(bool)Prop(req,"NeedValue"),"timeLimit",req==null?0:Field(req,"Timelimit"),"systemInput",req!=null&&(bool)Field(req,"IsSystemInput"));
    bool needValue=req!=null&&(bool)Prop(req,"NeedValue");
    var list=(IList)Field(ConsoleObject,"displayLineList");int start=Math.Max(0,list.Count-limit);if(request.ContainsKey("fromLine"))start=Math.Max(0,Math.Min(list.Count,I(request,"fromLine",0)));
+   // A cursor is expressed in the engine's absolute line space (deleted + buffered)
+   // so it keeps meaning when the engine trims old rows.
+   long deletedLines=0;
+   var deletedProperty=ConsoleObject.GetType().GetProperty("DeletedLines",Members);
+   if(deletedProperty!=null)deletedLines=Convert.ToInt64(deletedProperty.GetValue(ConsoleObject,null)??0L,CultureInfo.InvariantCulture);
+   else { var deletedField=ConsoleObject.GetType().GetField("deletedLines",Members); if(deletedField!=null)deletedLines=Convert.ToInt64(deletedField.GetValue(ConsoleObject)??0L,CultureInfo.InvariantCulture); }
+   bool cursorExpired=false;
+   if(request.ContainsKey("sinceCursor")) {
+    var requested=Convert.ToInt64(request["sinceCursor"],CultureInfo.InvariantCulture);
+    if(requested<deletedLines||requested>deletedLines+list.Count)cursorExpired=true;
+    else start=Math.Max(0,Math.Min(list.Count,(int)(requested-deletedLines)));
+   }
    int nextGeneration=Convert.ToInt32(Field(ConsoleObject,"newButtonGeneration"),CultureInfo.InvariantCulture);
    int currentGeneration=0;
    foreach(object line in list)foreach(object b in (Array)Prop(line,"Buttons"))if((bool)Prop(b,"IsButton"))currentGeneration=Math.Max(currentGeneration,Convert.ToInt32(Prop(b,"Generation"),CultureInfo.InvariantCulture));
@@ -332,7 +344,7 @@ namespace EraDSH {
     }
    }
    string fingerprint=ObservationHash(state,input,full,list,currentGeneration);
-   var result=Map("ok",true,"sessionId",SessionId,"observationId",SessionId+":"+fingerprint,"capturedUtc",DateTime.UtcNow.ToString("o"),"source","engine-display-buffer","consistency","same-ui-thread; animation frames are not revision-tracked","state",state,"input",input,"title",Clip(Window.Text,512),"text",mode=="visual"?null:text.ToString(),"lines",(mode=="visual"||!includeLines)?null:lines,"buttons",buttons,"buttonGeneration",currentGeneration,"omittedInactiveButtons",omittedInactive,"omittedButtons",omittedButtons,"filteredNoiseLines",filteredNoise,"collapsedSeparators",collapsed,"totalLines",list.Count,"fromLine",start,"returnedLines",includeLines?lines.Count:0,"omittedBefore",start,"omittedAfter",Math.Max(0,list.Count-start-limit),"rawTextLength",full.Length,"textTruncated",textCut,"textCharacterBudget",24000,"window",Map("handle",Window.Handle.ToInt64(),"clientWidth",Window.ClientSize.Width,"clientHeight",Window.ClientSize.Height));
+   var result=Map("ok",true,"sessionId",SessionId,"observationId",SessionId+":"+fingerprint,"capturedUtc",DateTime.UtcNow.ToString("o"),"source","engine-display-buffer","consistency","same-ui-thread; animation frames are not revision-tracked","state",state,"input",input,"title",Clip(Window.Text,512),"text",mode=="visual"?null:text.ToString(),"lines",(mode=="visual"||!includeLines)?null:lines,"buttons",buttons,"buttonGeneration",currentGeneration,"omittedInactiveButtons",omittedInactive,"omittedButtons",omittedButtons,"filteredNoiseLines",filteredNoise,"collapsedSeparators",collapsed,"cursor",deletedLines+list.Count,"nextCursor",deletedLines+Math.Min(list.Count,start+limit),"cursorBase",deletedLines,"cursorExpired",cursorExpired,"totalLines",list.Count,"fromLine",start,"returnedLines",includeLines?lines.Count:0,"omittedBefore",start,"omittedAfter",Math.Max(0,list.Count-start-limit),"rawTextLength",full.Length,"textTruncated",textCut,"textCharacterBudget",24000,"window",Map("handle",Window.Handle.ToInt64(),"clientWidth",Window.ClientSize.Width,"clientHeight",Window.ClientSize.Height));
    if(mode=="visual"||mode=="both"||mode=="auto")result["screenshot"]=Capture();
    if(request.ContainsKey("sinceObservationId")) {
     var since=Convert.ToString(request["sinceObservationId"]);

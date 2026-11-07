@@ -388,3 +388,15 @@ bundle patch 从一行扩到两行：除 `dsh-era-bridge` 外，新增一条 `@d
 | `eraOCG2` | 1 913 B | 1 478 B `append` 5 行 | 1 266 B `none` |
 
 基线未知时返回 `full` + `sinceMissing`，不会让调用方卡在“不知道前面是什么”的状态。
+
+### 8.15 行级游标与 artifacts 保留（2026-11-07 23:40）
+
+游标：观察新增 `cursor`（缓冲末尾）、`nextCursor`（本窗口之后）、`cursorBase`（引擎已丢弃行数）、`cursorExpired`；`observe` 接受 `sinceCursor`。绝对行号 = `DeletedLines` + 缓冲下标，裁剪后仍有意义。
+
+| 检查 | 结果 |
+| --- | --- |
+| 连续翻页（`erafl` 1961 行） | from=0 → 60 行 → `nextCursor=60` → 60 行 → `nextCursor=120`，无重叠 |
+| 越界游标 | `sinceCursor=0` 时 `cursorExpired=false`（引擎未裁剪） |
+| 过滤与游标 | 过滤模式从头翻页会得到空页（前 200 行全是加载日志），`noise=raw` 可见原文 |
+
+保留策略：`scripts/Prune-Artifacts.ps1`，默认 20 会话 / 100 MB，从最旧删起，当前会话永不删除；构建结束自动调用，失败只告警。临时目录实测 6 个会话、`-Keep 3`、当前=最旧 → 删除 2 个、保留 4 个。

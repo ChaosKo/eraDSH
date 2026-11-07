@@ -103,6 +103,12 @@ if($settings.EngineKind -eq 'core') {
  }
  $settingsPath=Join-Path $artifact 'session.json'
  $settingsFile | ConvertTo-Json | Set-Content -LiteralPath $settingsPath -Encoding UTF8
+ # Keep the artifact history bounded; a prune failure must never fail a good build.
+ try {
+  & (Join-Path $repositoryRoot 'scripts\Prune-Artifacts.ps1') -RepositoryRoot $repositoryRoot -Keep 20 -MaxMegabytes 100 -CurrentSession $artifact | Out-Null
+ } catch {
+  Write-Warning ('artifact prune skipped: ' + $_.Exception.Message)
+ }
  [pscustomobject]@{
   built=$true
   engineKind='core'
@@ -226,6 +232,12 @@ $settingsFile=[ordered]@{
 }
 $settingsPath=Join-Path $artifact 'session.json'
 $settingsFile | ConvertTo-Json | Set-Content -LiteralPath $settingsPath -Encoding UTF8
+# Keep the artifact history bounded; a prune failure must never fail a good build.
+try {
+ & (Join-Path $repositoryRoot 'scripts\Prune-Artifacts.ps1') -RepositoryRoot $repositoryRoot -Keep 20 -MaxMegabytes 100 -CurrentSession $artifact | Out-Null
+} catch {
+ Write-Warning ('artifact prune skipped: ' + $_.Exception.Message)
+}
 
 [pscustomobject]@{
  built=$true

@@ -287,7 +287,6 @@ internal static class Bridge
                 return Json(new Dictionary<string, object> { ["ok"] = true, ["status"] = "normal_close_scheduled" });
             case "observe":
             {
-                Record("observe-request", request.GetRawText());
                 var budget = Environment.GetEnvironmentVariable("ERA_BRIDGE_READY_MS") is { Length: > 0 } ms && int.TryParse(ms, out var parsed) ? parsed : 120000;
                 var waited = System.Diagnostics.Stopwatch.StartNew();
                 // Wait on the idle-refreshed cache until the engine is in a steady input
@@ -469,6 +468,10 @@ internal static class Bridge
         if (noise.Length > 0) options["noise"] = noise;
         var since = GetString(request, "sinceObservationId");
         if (since.Length > 0) options["since"] = since;
+        if (request.TryGetProperty("sinceCursor", out var sinceCursor) && sinceCursor.ValueKind == JsonValueKind.Number)
+        {
+            options["cursor"] = sinceCursor.GetInt64();
+        }
         return OnUi(() => SnapshotCore(options));
     }
 
@@ -529,8 +532,38 @@ internal static class Bridge
         if (linesProperty is null) throw new InvalidOperationException("DisplayLineList is absent in this build");
         var allLines = (IList)linesProperty.GetValue(_console) ?? new List<object>();
 
+        // Engine line numbers are absolute for the session: DeletedLines counts the
+        // rows the engine has already dropped from the front of its buffer. A cursor is
+        // expressed in that space so it stays meaningful after trimming.
+        long deletedLines = 0;
+        try
+        {
+            var deletedProperty = _consoleType.GetProperty("DeletedLines", AnyInstance);
+            if (deletedProperty != null) deletedLines = Convert.ToInt64(deletedProperty.GetValue(_console) ?? 0L, CultureInfo.InvariantCulture);
+            else
+            {
+                var deletedField = _consoleType.GetField("deletedLines", AnyInstance);
+                if (deletedField != null) deletedLines = Convert.ToInt64(deletedField.GetValue(_console) ?? 0L, CultureInfo.InvariantCulture);
+            }
+        }
+        catch { }
+
         var start = Math.Max(0, allLines.Count - limit);
         if (options.TryGetValue("fromLine", out var fromValue)) start = Math.Max(0, Math.Min(allLines.Count, Convert.ToInt32(fromValue)));
+
+        var cursorExpired = false;
+        if (options.TryGetValue("cursor", out var cursorValue))
+        {
+            var requested = Convert.ToInt64(cursorValue, CultureInfo.InvariantCulture);
+            if (requested < deletedLines || requested > deletedLines + allLines.Count)
+            {
+                cursorExpired = true;
+            }
+            else
+            {
+                start = Math.Max(0, Math.Min(allLines.Count, (int)(requested - deletedLines)));
+            }
+        }
 
         var state = _consoleType.GetProperty("state", AnyInstance)?.GetValue(_console)?.ToString() ?? "unknown";
         var request = _consoleType.GetField("inputReq", AnyInstance)?.GetValue(_console);
@@ -685,6 +718,10 @@ internal static class Bridge
             ["omittedButtons"] = omittedButtons,
             ["filteredNoiseLines"] = filteredNoise,
             ["collapsedSeparators"] = collapsed,
+            ["cursor"] = deletedLines + allLines.Count,
+            ["nextCursor"] = deletedLines + Math.Min(allLines.Count, start + limit),
+            ["cursorBase"] = deletedLines,
+            ["cursorExpired"] = cursorExpired,
             ["totalLines"] = allLines.Count,
             ["fromLine"] = start,
             ["returnedLines"] = includeLines ? lines.Count : 0,
