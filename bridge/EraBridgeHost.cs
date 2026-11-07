@@ -177,6 +177,7 @@ namespace EraDSH {
    if(action=="status")return Map("ok",true,"sessionId",SessionId,"ready",Window!=null,"exited",Exited,"failure",Failure,"engineAssembly",Engine.FullName,"runtimeMode",S(Settings,"runtimeMode","copy"),"gameDir",GameDir,"runtimeDirectory",RuntimeDir,"processId",System.Diagnostics.Process.GetCurrentProcess().Id);
    if(action=="close")return Map("ok",true,"status","normal_close_scheduled");
    if(action=="observe")return OnUI(delegate{return Snapshot(request);});
+   if(action=="advance")return OnUI(delegate{return Advance(request);});
    if(action!="act")return Error("UNKNOWN_ACTION","Use status, observe, act, or close");
    string actionId=S(request,"actionId");Guid parsed;
    if(!Guid.TryParse(actionId,out parsed))return Error("INVALID_ACTION_ID","A unique GUID actionId is required");
@@ -286,6 +287,34 @@ namespace EraDSH {
    delta["removed"]=common==previous.Count?0:previous.Count-common;
    delta["lines"]=DeltaLines(displayed,indices,common);
    result["delta"]=delta;result["text"]=null;result["lines"]=null;
+  }
+
+  // Era narration is printed a few lines at a time and only needs "Enter" between
+  // chunks. This loop presses Enter while the engine waits for a plain key and stops
+  // the moment a decision is required, so one call can carry a whole scene.
+  static Dictionary<string,object> Advance(Dictionary<string,object> request) {
+   int maxSteps=request.ContainsKey("maxSteps")?Math.Max(1,Math.Min(200,I(request,"maxSteps",20))):20;
+   string mode=S(request,"mode","text");int limit=I(request,"limitLines",80);
+   var press=ConsoleObject.GetType().GetMethod("PressEnterKey",Members,null,new[]{typeof(bool),typeof(string),typeof(bool)},null);
+   var snapshot=Snapshot(Map("mode",mode,"limitLines",limit));
+   int steps=0;string stopped="max-steps";string previousId=Convert.ToString(snapshot["observationId"]);
+   while(true) {
+    string state=Convert.ToString(snapshot["state"]);
+    if(state!="WaitInput") { stopped="not-waiting-input";break; }
+    var input=(Dictionary<string,object>)snapshot["input"];
+    string kind=Convert.ToString(input["kind"]);bool needValue=(bool)input["needValue"];
+    if(needValue||kind=="IntValue"||kind=="StrValue"||kind=="IntButton"||kind=="StrButton"||kind=="AnyValue"||kind=="Void") { stopped="input-required";break; }
+    if(kind!="EnterKey"&&kind!="AnyKey") { stopped="input-required";break; }
+    if(steps>=maxSteps) { stopped="max-steps";break; }
+    if(press==null) { stopped="adapter-member-missing";break; }
+    press.Invoke(ConsoleObject,new object[]{false,"",false});
+    steps++;
+    var next=Snapshot(Map("mode",mode,"limitLines",limit));
+    string nextId=Convert.ToString(next["observationId"]);
+    if(string.Equals(nextId,previousId,StringComparison.Ordinal)) { stopped="stalled";snapshot=next;break; }
+    previousId=nextId;snapshot=next;
+   }
+   return Map("ok",true,"steps",steps,"stoppedBecause",stopped,"observation",snapshot);
   }
 
   static Dictionary<string,object> Snapshot(Dictionary<string,object> request) {

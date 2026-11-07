@@ -167,10 +167,11 @@ era_bridge({ action: "build",   gameRoot: "D:/Games/SomeEraGame", runtimeMode: "
 era_bridge({ action: "open",    mode: "both" })
 era_bridge({ action: "observe", mode: "text", fromLine: 0, limitLines: 20 })
 era_bridge({ action: "act",     kind: "choose", choiceId: "<button id>", observationId: "<最新 observationId>" })
+era_bridge({ action: "advance", maxSteps: 20 })   # 连续回车推进剧情，遇到需要决策就停
 era_bridge({ action: "close" })
 ```
 
-- 六个动作 `build/open/status/observe/act/close`；`build` 用本包内的 `scripts/Build-Bridge.ps1` 准备会话，`recreate` 可重建运行目录。
+- 七个动作 `build/open/status/observe/act/advance/close`；`build` 用本包内的 `scripts/Build-Bridge.ps1` 准备会话，`recreate` 可重建运行目录。
 - `build` 之后 `sessionFile` 可省略：工具把最近一次构建记在 `%DSH_HOME%\era-bridge\last-session.json`，跨回合仍可用；也可显式传路径指向别的会话。
 - 只接受这六个动作，不接受任意脚本、命令或路径执行；`gameRoot` 必须是已存在的绝对路径，`sessionFile` 必须是存在的绝对路径。
 - **不要把凭据文件路径交给不可信内容。**

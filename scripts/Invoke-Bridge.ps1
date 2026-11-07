@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
  [Parameter(Mandatory=$true)][string]$SessionFile,
- [Parameter(Mandatory=$true)][ValidateSet('open','status','observe','act','close')][string]$Action,
+ [Parameter(Mandatory=$true)][ValidateSet('open','status','observe','act','advance','close')][string]$Action,
  [ValidateSet('text','visual','both','auto')][string]$Mode='text',
  [ValidateRange(1,200)][int]$LimitLines=80,
  [int]$FromLine=-1,
@@ -14,6 +14,7 @@ param(
  [switch]$IncludeLines,
  [string]$SinceObservationId,
  [long]$SinceCursor = -1,
+ [int]$MaxSteps = 20,
  [ValidateSet('filter','raw')][string]$Noise='filter',
  [string]$OutputPath
 )
@@ -52,6 +53,7 @@ $request=[ordered]@{token=$settings.token;action=$Action;mode=$Mode;limitLines=$
 if($IncludeLines) { $request.includeLines=$true }
 if($SinceObservationId) { $request.sinceObservationId=$SinceObservationId }
 if($SinceCursor -ge 0) { $request.sinceCursor=$SinceCursor }
+if($Action -eq 'advance') { $request.maxSteps=$MaxSteps }
 if($Noise -ne 'filter') { $request.noise=$Noise }
 if($Action -eq 'open') { $request.action='observe' }
 if($FromLine -ge 0) { $request.fromLine=$FromLine }

@@ -24,7 +24,7 @@ const dshHome = process.env.DSH_HOME && process.env.DSH_HOME.length > 0
 const stateRoot = join(dshHome, 'era-bridge')
 const stateFile = join(stateRoot, 'last-session.json')
 
-const ACTIONS = ['build', 'open', 'status', 'observe', 'act', 'close']
+const ACTIONS = ['build', 'open', 'status', 'observe', 'act', 'advance', 'close']
 const RUNTIME_MODES = ['inplace', 'copy']
 
 function run({ powershell, script, args }) {
@@ -92,7 +92,8 @@ export function apply(ctx, config = {}) {
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ACTIONS, description: 'build prepares a session for a game folder; open launches the managed instance; observe reads state; act submits one input; status reports liveness; close shuts the managed instance down cleanly.' },
+        action: { type: 'string', enum: ACTIONS, description: 'build prepares a session for a game folder; open launches the managed instance; observe reads state; act submits one input; advance presses Enter repeatedly while the game is only narrating (stops when a button, a value, a text entry, a non-waiting state or maxSteps is reached); status reports liveness; close shuts the managed instance down cleanly.' },
+        maxSteps: { type: 'integer', minimum: 1, maximum: 200, description: 'advance only: how many Enter presses to allow before returning (default 20). The reply says steps and stoppedBecause (input-required, not-waiting-input, max-steps, stalled).' },
         gameRoot: { type: 'string', description: 'Absolute path of the Era game folder. Required by build; the scripts that operate it ship inside this plugin, so no repository path is ever needed.' },
         engineExecutable: { type: 'string', description: 'Optional launcher file name inside gameRoot; omitted, the engine is detected automatically.' },
         runtimeMode: { type: 'string', enum: RUNTIME_MODES, description: 'inplace (default) runs the engine from the game folder and copies nothing; copy mirrors the folder into the plugin runtime directory first.' },
@@ -159,6 +160,7 @@ export function apply(ctx, config = {}) {
       if (args.includeLines === true) cli.push('-IncludeLines')
       if (args.sinceObservationId) cli.push('-SinceObservationId', String(args.sinceObservationId))
       if (args.sinceCursor != null) cli.push('-SinceCursor', String(args.sinceCursor))
+      if (action === 'advance' && args.maxSteps != null) cli.push('-MaxSteps', String(args.maxSteps))
       if (args.noise) cli.push('-Noise', String(args.noise))
       if (action === 'act') {
         if (!args.observationId) throw new Error('act requires observationId from the latest observation')

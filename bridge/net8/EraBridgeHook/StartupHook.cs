@@ -304,9 +304,91 @@ internal static class Bridge
             }
             case "act":
                 return Act(request);
+            case "advance":
+                return Advance(request);
             default:
                 return Json(Error("UNKNOWN_ACTION", "Use status, observe, act, or close"));
         }
+    }
+
+    // Era narration is printed a few lines at a time and only needs "Enter" between
+    // chunks. This loop presses Enter while the engine is waiting for a plain key and
+    // stops the moment a decision is required, so one call can carry a whole scene
+    // without spending one round trip per paragraph.
+    private static string Advance(JsonElement request)
+    {
+        var maxSteps = request.TryGetProperty("maxSteps", out var stepsValue) ? Math.Clamp(stepsValue.GetInt32(), 1, 200) : 20;
+        var mode = GetString(request, "mode") is { Length: > 0 } modeValue ? modeValue : "text";
+        var limit = request.TryGetProperty("limitLines", out var limitValue) ? limitValue.GetInt32() : 80;
+        var press = _consoleType?.GetMethod("PressEnterKey", AnyInstance, null, new[] { typeof(bool), typeof(string), typeof(bool) }, null);
+
+        var result = OnUi(() =>
+        {
+            var snapshot = SnapshotCore(new Dictionary<string, object> { ["mode"] = mode, ["limitLines"] = limit });
+            var steps = 0;
+            var stopped = "max-steps";
+            var previousId = Convert.ToString(snapshot["observationId"]);
+
+            while (true)
+            {
+                var state = Convert.ToString(snapshot["state"]);
+                if (state != "WaitInput")
+                {
+                    stopped = "not-waiting-input";
+                    break;
+                }
+
+                var input = (Dictionary<string, object>)snapshot["input"];
+                var kind = Convert.ToString(input["kind"]);
+                var needValue = input.TryGetValue("needValue", out var need) && need is bool needBool && needBool;
+
+                if (needValue || kind == "IntValue" || kind == "StrValue" || kind == "IntButton" || kind == "StrButton" || kind == "AnyValue" || kind == "Void")
+                {
+                    stopped = "input-required";
+                    break;
+                }
+                if (kind != "EnterKey" && kind != "AnyKey")
+                {
+                    stopped = "input-required";
+                    break;
+                }
+                if (steps >= maxSteps)
+                {
+                    stopped = "max-steps";
+                    break;
+                }
+                if (press is null)
+                {
+                    stopped = "adapter-member-missing";
+                    break;
+                }
+
+                press.Invoke(_console, new object[] { false, string.Empty, false });
+                steps++;
+
+                var next = SnapshotCore(new Dictionary<string, object> { ["mode"] = mode, ["limitLines"] = limit });
+                var nextId = Convert.ToString(next["observationId"]);
+                if (string.Equals(nextId, previousId, StringComparison.Ordinal))
+                {
+                    // Pressing changed nothing twice in a row: the engine is animating or
+                    // ignoring the key, so stop instead of hammering it.
+                    stopped = "stalled";
+                    snapshot = next;
+                    break;
+                }
+                previousId = nextId;
+                snapshot = next;
+            }
+
+            return new Dictionary<string, object>
+            {
+                ["ok"] = true,
+                ["steps"] = steps,
+                ["stoppedBecause"] = stopped,
+                ["observation"] = snapshot,
+            };
+        });
+        return Json(result);
     }
 
     private static string Act(JsonElement request)

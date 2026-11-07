@@ -400,3 +400,14 @@ bundle patch 从一行扩到两行：除 `dsh-era-bridge` 外，新增一条 `@d
 | 过滤与游标 | 过滤模式从头翻页会得到空页（前 200 行全是加载日志），`noise=raw` 可见原文 |
 
 保留策略：`scripts/Prune-Artifacts.ps1`，默认 20 会话 / 100 MB，从最旧删起，当前会话永不删除；构建结束自动调用，失败只告警。临时目录实测 6 个会话、`-Keep 3`、当前=最旧 → 删除 2 个、保留 4 个。
+
+### 8.16 自动连回车（2026-11-07 23:55）
+
+新增 `advance`：只在引擎等待 `EnterKey`/`AnyKey` 且没有按钮可点时连续回车，遇到以下任一情况立即停止并说明原因：出现按钮或需要取值（`input-required`）、离开 `WaitInput`（`not-waiting-input`）、达到 `maxSteps`、连续两次画面不变（`stalled`）。
+
+| 场景 | 结果 |
+| --- | --- |
+| `EraMaou` 序章（决定性别后进入正文） | 一次调用连按 **7 次**回车，停在 `[100] 你发动了魔王真眼…` 的角色选择处 |
+| `eraOCG2` / `eratw` 菜单页 | `steps=0`、`stoppedBecause=input-required`，不会误点按钮 |
+
+整个过程在一次调用内完成，避免每段剧情一次往返。
