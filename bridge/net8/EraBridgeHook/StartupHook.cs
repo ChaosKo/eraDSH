@@ -250,19 +250,10 @@ internal static class Bridge
         {
             return false;
         }
-        // Short TWAIT/TINPUT fade loops (e.g. OCG2 title fade-in) set timeLimit > 0 and run a timer
-        // while NeedValue is false; wait for them to finish so observe lands on the real menu.
-        if (snapshot.TryGetValue("input", out var inputObj) && inputObj is Dictionary<string, object> input)
-        {
-            var timeLimit = input.TryGetValue("timeLimit", out var tl) ? Convert.ToInt64(tl, CultureInfo.InvariantCulture) : -1;
-            var needValue = input.TryGetValue("needValue", out var nv) && nv is bool b && b;
-            var runningTimer = input.TryGetValue("runningTimer", out var rt) && rt is bool rtb && rtb;
-            if ((runningTimer || (timeLimit > 0 && timeLimit <= 2000)) && !needValue)
-            {
-                return false;
-            }
-        }
-        return true;
+        // A running redraw/timer is normal for these engines and never stops, so it must
+        // not gate readiness: that produced observation calls that blocked until the
+        // window was closed. Having lines to show is enough to answer.
+        return snapshot.TryGetValue("totalLines", out var lines) && Convert.ToInt32(lines) > 0;
     }
 
     private static string Dispatch(JsonElement request)
@@ -287,7 +278,7 @@ internal static class Bridge
                 return Json(new Dictionary<string, object> { ["ok"] = true, ["status"] = "normal_close_scheduled" });
             case "observe":
             {
-                var budget = Environment.GetEnvironmentVariable("ERA_BRIDGE_READY_MS") is { Length: > 0 } ms && int.TryParse(ms, out var parsed) ? parsed : 120000;
+                var budget = Environment.GetEnvironmentVariable("ERA_BRIDGE_READY_MS") is { Length: > 0 } ms && int.TryParse(ms, out var parsed) ? parsed : 15000;
                 var waited = System.Diagnostics.Stopwatch.StartNew();
                 // Wait on the idle-refreshed cache until the engine is in a steady input
                 // state, then build a fresh snapshot so every option is honoured.
@@ -296,9 +287,15 @@ internal static class Bridge
                     if (IsSteadySnapshot(CachedSnapshot())) break;
                     Thread.Sleep(80);
                 }
-                if (!IsSteadySnapshot(CachedSnapshot()))
+                var cached = CachedSnapshot();
+                if (!IsSteadySnapshot(cached))
                 {
-                    return Json(CachedSnapshot() ?? Error("NOT_READY", "engine did not reach a steady input state in time"));
+                    // Never block on a screen that never becomes "steady": answer with what
+                    // is known and let the caller decide whether to look again.
+                    if (cached is null) return Json(Error("NOT_READY", "engine has no screen yet"));
+                    cached["pending"] = true;
+                    cached["observationAgeMs"] = (int)(DateTime.UtcNow - _cachedAt).TotalMilliseconds;
+                    return Json(cached);
                 }
                 return Json(Snapshot(request));
             }

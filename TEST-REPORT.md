@@ -423,3 +423,19 @@ bundle patch 从一行扩到两行：除 `dsh-era-bridge` 外，新增一条 `@d
 文档：README 收缩为面向使用者的一页（能力、依赖、`dsh plugin add github:ChaosKo/eraDSH` 安装、三分钟上手、配置与索引），技术内容拆到新增的 [docs/architecture.md](docs/architecture.md)（组件、两种宿主、协议字段、错误码、限额）与 [docs/engine-detection.md](docs/engine-detection.md)（引擎分类与选择顺序、运行时要求）。README 旧锚点 `#两种运行方式` 已不存在，`docs/observation-cost.md` 中的链接改指 architecture。
 
 说明：GitHub 安装路径按 `dsh plugin` 行为（转发 pnpm，启动时自动登记声明了 `dsh.bundle` 的新依赖）写入文档，未在本机实际执行，以免替换当前的本地链接安装。
+
+### 8.18 修复 open 卡死（2026-11-08 00:20）
+
+现象：`eraOCG2` 上 `open` 不返回，直到手动关闭窗口才回应，此时进程已退出、`act` 无效。
+
+根因：钩子的就绪判定要求"画面稳定"，把"定时器已停"也算了进去；Era 的重绘/动画定时器不会停，判定永远不成立，于是 observe 一直等到 120 秒上限。
+
+修复：
+
+| 项 | 改动 |
+| --- | --- |
+| 就绪条件 | 只看状态（非 `Initializing`/`Running`/`Sleep`）与行数，不再看定时器 |
+| 等待上限 | 120 秒 → 15 秒（`ERA_BRIDGE_READY_MS` 可覆盖） |
+| 超时行为 | 返回当前画面并标 `pending: true` + `observationAgeMs`，不再空等 |
+
+实测（`eraOCG2`）：修复前 `open` 需等到窗口关闭；修复后 **11.2 秒**返回 `WaitInput`、31 行、`pending` 为空；把上限临时调到 5 秒时如实返回 `state=Initializing, pending=true`，不会挂住。
