@@ -474,3 +474,14 @@ bundle patch 从一行扩到两行：除 `dsh-era-bridge` 外，新增一条 `@d
 | `fresh-timeout` | 主动取快照失败时：超时值、回调是否执行、异常信息 |
 
 实测（`eraOCG2`，正常路径）：`open` 12.3 秒，`observe-wait` 记录 `waitedMs=11658, steady=true, cacheAgeMs=52, lines=36`。若下次仍卡住，这三条记录能直接指出是"没等到就绪"还是"UI 线程没执行回调"。
+
+### 8.21 open 改为非阻塞（2026-11-08 00:55）
+
+按使用者建议把"启动"与"采样"拆开：
+
+| 动作 | 新行为 |
+| --- | --- |
+| `open` | 起进程后立刻返回 `launched=true, pending=true, state=starting`，不含观察 |
+| `observe` | 负责等待与采样；未就绪返回 `pending:true`，调用方再调一次 |
+
+实测（`eraOCG2`）：`open` **0.72 秒**返回，`observe` 12.1 秒后给出 `WaitInput` 与 3 个按钮。此前 open 要等同一段时间，且任何等待条件失效都会表现为整体卡死。

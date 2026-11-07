@@ -55,7 +55,12 @@ if($SinceObservationId) { $request.sinceObservationId=$SinceObservationId }
 if($SinceCursor -ge 0) { $request.sinceCursor=$SinceCursor }
 if($Action -eq 'advance') { $request.maxSteps=$MaxSteps }
 if($Noise -ne 'filter') { $request.noise=$Noise }
-if($Action -eq 'open') { $request.action='observe' }
+if($Action -eq 'open') {
+ # Launching and waiting for a usable screen are separate concerns: open must return
+ # as soon as the process exists, otherwise one engine's slow start blocks the caller.
+ # A startup-hook session answers with status; the caller samples with observe.
+ if($settings.launchMode -eq 'startup-hook') { $request.action='status' } else { $request.action='observe' }
+}
 if($FromLine -ge 0) { $request.fromLine=$FromLine }
 if($Action -eq 'act') {
  if([string]::IsNullOrWhiteSpace($ObservationId)) { throw 'act requires an observation ID' }

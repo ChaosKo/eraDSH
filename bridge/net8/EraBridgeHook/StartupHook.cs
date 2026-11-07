@@ -294,6 +294,10 @@ internal static class Bridge
                     ["launchMode"] = "startup-hook",
                     ["gameDir"] = Str("gameRoot"),
                     ["processId"] = Environment.ProcessId,
+                    ["launched"] = true,
+                    ["pending"] = _cached is null || !IsSteadySnapshot(_cached),
+                    ["state"] = _cached is null ? "starting" : Convert.ToString(_cached["state"]),
+                    ["totalLines"] = _cached is null ? 0 : Convert.ToInt32(_cached["totalLines"]),
                 });
             case "close":
                 return Json(new Dictionary<string, object> { ["ok"] = true, ["status"] = "normal_close_scheduled" });

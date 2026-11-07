@@ -33,9 +33,9 @@
 
                 六个动作，一次调用只做一件事：
                 - build：为某个游戏目录准备一局会话，返回 sessionFile。构建脚本随插件分发，不需要也不能去找仓库。
-                - open：启动实例并返回首个观察。同一会话不要重复 open。
+                - open：只负责启动实例，立刻返回 launched=true / pending=true，**不等画面**；之后用 observe 采样。同一会话不要重复 open。
                 - status：确认实例是否还活着；长时间停顿后先 status 再 act。
-                - observe：读取当前状态。mode=text 取正文与按钮，visual 取截图，both 两者都要，auto 目前等同 both。
+                - observe：读取当前状态。mode=text 取正文与按钮，visual 取截图，both 两者都要，auto 目前等同 both。返回里 pending=true 表示引擎还没到可操作的画面，稍等再 observe 一次；连续两次 pending 就停下来问用户。
                 - act：提交一次输入。kind=choose 按按钮并给 choiceId；kind=input 提交 value；kind=continue 回应 EnterKey 或 AnyKey 等待。
                 - close：正常关闭实例。自主游玩过程中不要调用，结束时用它收尾。
 

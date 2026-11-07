@@ -66,8 +66,9 @@ dsh plugin --profile web add C:\path\to\eraDSH
 
 ```text
 era_bridge({ action: "build", gameRoot: "D:/Games/SomeEraGame" })
-era_bridge({ action: "open" })
-era_bridge({ action: "observe" })            # 看当前画面与按钮
+era_bridge({ action: "open" })                 # 只启动，立刻返回
+era_bridge({ action: "observe" })              # 采样：pending 还在就再调一次
+era_bridge({ action: "observe" })              # 看当前画面与按钮
 era_bridge({ action: "act", kind: "choose", choiceId: "<按钮 id>", observationId: "<最新 observationId>" })
 era_bridge({ action: "advance", maxSteps: 20 })   # 剧情连按回车，遇到决策就停
 era_bridge({ action: "close" })
