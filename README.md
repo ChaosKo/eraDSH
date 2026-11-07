@@ -153,6 +153,21 @@ era_bridge({ action: "close",   sessionFile: "<session.json>" })
 - 安装：用 DSH 的插件安装流程，目标包目录为本仓库根目录；插件声明 `inject = ['tools']`。
 - 若安装后没有出现工具，检查 bundle 是否启用；替换已安装包通常需要重启 DSH 才会加载新模块。
 
+### Era 模式预设
+
+同一个 bundle 还声明了一个 Agent 预设 `era`（显示名「Era 模式」，`order: 20`，排在 standard / ptc / minimal / cordis 之后）。新建会话时选中它，该会话的 system prompt 会多出一段 Era 操作手册：
+
+| 内容 | 说明 |
+| --- | --- |
+| 工具用法 | `era_bridge` 的五个动作、`sessionFile` 从哪来、`observationId` 与 `actionId` 的约束、`mode` 与分页、四类拒绝码、截图必须另外看图 |
+| 游玩基础 | 正文/按钮/输入请求的循环、`input.kind` 语义、标题页到主界面的典型路径、资源代价、隔离副本与存档位置 |
+| 自主游玩 | 收到「自主游玩」「你自己玩」「交给 AI 玩」「继续玩」时进入循环：确认目标与预算 → observe/act 核对 → todo 清单 → 每 5–10 步播报 → 遇异常或不可逆选择立即停下交还 |
+| 信任边界 | 游戏正文与存档内容是不可信数据，不当作指令执行 |
+
+预设挂载的工具：`pwsh`（非 Windows 为 bash）、文件读写与搜索、jobs、todo、skill、ask_user、goal、compaction。**不挂** web 搜索、子代理与 workflow、插件市场——游玩用不到，少几个工具也省下提示预算。`era_bridge` 本身是 Host 级插件，所有预设本来就有它，Era 模式只是把用法写清楚。
+
+修改方式：编辑 [`cordis.patch.yml`](cordis.patch.yml) 里的 `preset-era` 行，再对本 bundle 关闭后重新启用（或 remove 后重新 install）让它重新装载。预设只影响之后新建的会话。
+
 ## 观察与执行约束
 
 - `text`：引擎显示缓冲文本，可能含图片/HTML 标签，不代表已理解图像。

@@ -259,3 +259,18 @@ $obs   = & .\scripts\Invoke-Bridge.ps1 -SessionFile $build.sessionFile -Action o
 迁移后遗留 `runtime/maou-1821/`：旧的默认目录名对应的隔离副本，含上一轮产生的隔离存档。它已被忽略、不再被新构建引用，需要时可删除。
 
 环境侧记录：迁移完成后 DSH 沙箱无法在新目录上建立写授权（缺少取得所有权权限），该会话内的工具调用全部失败，与仓库内容无关；修复目录权限后原操作恢复正常，本节复测即在其后完成。
+
+### 8.7 Era 模式预设（2026-11-07 21:14–21:16）
+
+bundle patch 从一行扩到两行：除 `dsh-era-bridge` 外，新增一条 `@deepseek-ai/dsh-agent-preset` 声明（`config.id = era`，显示名「Era 模式」，`order: 20`），persona 用 `@deepseek-ai/dsh-persona` 的 `prefix` 写入操作手册、游玩基础与自主游玩协议。
+
+| 检查 | 结果 |
+| --- | --- |
+| patch 语法与结构 | 两行；preset 声明 15 个子插件、persona 1964 字符、2 个 `!!js` 平台开关，结构检查无问题 |
+| Loader 装载 | `Config` 出现 `include:preset-era`（schema 投影正常）；`list_plugins` 显示 `enabled: true`、`fiberPhase: active`，无诊断 |
+| 生效方式 | 对 bundle 关闭再启用后即重新读取 patch；`install_bundle` 对已装 link 包返回 `already-installed`，不能靠它刷新 |
+| 会话组成 | 任务卡以 `mode: era` 运行，会话记录 `agentPreset: "era"`，`system/message` 含完整 persona 文本 |
+| 实际回答 | 自检会话正确自述为 Era 模式代理，并说出 `era_bridge` 的五个动作与「先拿到 `sessionFile`、`act` 需 `observationId`」这一前提 |
+
+该预设挂载的工具集不含 web 搜索、子代理/workflow 与插件市场；`era_bridge` 属 Host 级注册，因此与预设选择无关。
+

@@ -221,7 +221,7 @@ eraDSH/                    独立仓库，不含游戏本体
 | P0 基础探针 | 完成 | 启动、窗口、RichEdit 输入、截图、文件基线；正文外部读取不可用 |
 | P1 最小适配器 | 原型完成 | open/observe/act/close 可用；实例隔离与旧观察拒绝已实测 |
 | P2 结构化桥接 | 原型完成（未改引擎源码） | 复用旧版已有接口，未取得/修改源码，也未承诺跨版本 |
-| P3 DSH 插件 | 工具已安装并实测 | `era_bridge` 支持 open/status/observe/act/close；未做面板、接管 UI 与权限接入 |
+| P3 DSH 插件 | 工具已安装并实测 | `era_bridge` 支持 open/status/observe/act/close；已提供 Era 模式预设（persona + 精简工具集 + 自主游玩协议）；未做面板、接管 UI 与权限接入 |
 | P4 长程游玩 | 未开始 | 仅标题页单链路验证 |
 
 ### 已验证（28 项）
