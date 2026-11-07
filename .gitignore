@@ -15,3 +15,9 @@ node_modules/
 
 # bridge runtime state when DSH_HOME is unavailable
 .era-bridge-state/
+
+# .NET build output for the startup-hook adapter
+bridge/net8/**/bin/
+bridge/net8/**/obj/
+tools/**/bin/
+tools/**/obj/

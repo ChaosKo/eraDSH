@@ -104,3 +104,40 @@
 - 其他 .NET Framework 血统的 Emuera 分支（不同作者改版）未逐个测试；当前只声明 1.821 已验证、1.822 可加载但未验证。
 - 未实测这些 .NET Core 变体能否正常运行（不属于本桥接的能力范围），因此"游戏本体可用"与"桥接可用"是两件事。
 - 解包可行性只做了静态特征判断，尚未真正提取过程序集。
+
+## 8. P2 实施记录：.NET 8 变体已可通过启动钩子驱动（2026-11-07）
+
+**方案改变。** 原计划“解包 + 新宿主”被实测推翻：`DOTNET_STARTUP_HOOKS` 可以把适配器注入引擎**自己的进程**，apphost、依赖解析、路径语义全部保持原生，不需要解包、也不需要迁移运行目录。
+
+实现的部件：
+
+| 部件 | 位置 | 作用 |
+| --- | --- | --- |
+| 启动钩子适配器 | `bridge/net8/EraBridgeHook/` | 在引擎进程内提供与旧宿主相同的命名管道协议 |
+| 构建分支 | `scripts/Build-Bridge.ps1` | 识别 `engineKind=core`，生成 `launchMode=startup-hook` 会话 |
+| 启动分支 | `scripts/Invoke-Bridge.ps1` | 用原 exe 启动，并注入 `DOTNET_STARTUP_HOOKS` / `ERA_BRIDGE_SETTINGS` |
+| 客户端 | 无改动 | 仍是 `open/observe/act/close`，`era_bridge` 工具直接可用 |
+
+实测（`eraOCG2_20261009`，x64，.NET 8.0.21）：
+
+| 检查 | 结果 |
+| --- | --- |
+| 构建 | `engineKind=core`、`launchMode=startup-hook`、不产生任何副本 |
+| 观察 | `ok=true`、`WaitInput`、31 行、`EnterKey`、正文中文正确 |
+| 输入 | `act continue` → `submitted=true`、`observationChanged=true` |
+| 状态 | `ready=true`、`engineFamily=core` |
+| 关闭 | 正常关闭，进程退出 |
+| 数据 | 测试期间 `Sav`、`emuera.log` 移出后还原，真实存档未被写 |
+
+关键实现取舍（都有实测依据）：
+
+1. **不要用 `BeginInvoke` 取观察。** 引擎加载数据时消息循环长时间不排空，排队请求会超时；改为在 `Application.Idle` 中周期性生成快照，请求线程直接读缓存。
+2. **动作要对“已交付的观察”校验。** 标题页有动画，按“最新画面”比对会让每个动作都变成 `STALE_OBSERVATION`；改为记住最近 8 个观察并接受其中任意一个。
+3. **窗口对象要每次重新解析。** 初始化早期的 Form 可能被替换，缓存句柄会让请求永远等不到完成。
+
+尚未完成：
+
+- `visual`/`both` 截图（钩子内还没有 PrintWindow 实现）。
+- 按钮 `choose` 路径尚未在该引擎上验证（标题页只用了 EnterKey）。
+- 首次使用需要 .NET SDK 构建适配器（之后复用 DLL）；未打包分发。
+- `Lazyloading` 系列（x86 与多 DLL 变体）未测试。

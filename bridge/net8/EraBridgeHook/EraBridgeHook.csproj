@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>EraBridgeHook</AssemblyName>
+    <RootNamespace>EraBridgeHook</RootNamespace>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <AssemblyVersion>0.3.0.0</AssemblyVersion>
+    <FileVersion>0.3.0.0</FileVersion>
+  </PropertyGroup>
+</Project>

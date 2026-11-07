@@ -82,7 +82,7 @@ DSH AI / PowerShell 调用者
 
 因此一个目录里同时存在 `Emuera1822.exe`（1.822）与游戏自带的旧启动器时，会优先选中已验证的旧版，不会误用新版。
 
-> **兼容性边界**：适配器用反射加载引擎，只支持 **.NET Framework** 血统的 Emuera。Emuera.NET / Lazyloading EE 等 **.NET (Core) 单文件发布**的变体无法加载（exe 内没有 CLR 头），会被识别为 `core` 并给出说明。先用只读探针看清单：
+> **兼容性边界**：适配器按引擎形态分两条路线。**.NET Framework** 血统（1.8xx 系列）走反射加载；**.NET (Core) 单文件发布**（Emuera.NET / Lazyloading EE 等）走 `DOTNET_STARTUP_HOOKS` 注入，在引擎自己的进程里读显示缓冲并提交输入——不解包、不改路径、不需要迁移数据。原生 exe 仍会被识别为 `native` 并拒绝。先用只读探针看清单：
 >
 > ```powershell
 > .\scripts\Get-EraDshEngines.ps1 -GameRoot 'D:\Games\SomeEraGame'

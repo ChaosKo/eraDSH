@@ -334,3 +334,20 @@ bundle patch 从一行扩到两行：除 `dsh-era-bridge` 外，新增一条 `@d
 
 未解决（列入计划）：这批变体的托管程序集未压缩地嵌在 exe 里（`BSJB` 16–25 次、无 `System.Private.CoreLib`），理论上可解包；但成员表已变（`Emuera.UI` 命名空间、无 `GetDisplayStrings`），需要新宿主 + 新成员映射，见计划 P2。
 
+
+### 8.11 .NET 8 引擎接入（2026-11-07 22:05–22:22）
+
+目标引擎 `eraOCG2_20261009`（`Emuera.NET 1824+v22+EMv18+EEv52fix.exe`，bundle 6.0 / net8.0 / x64）。
+
+| 检查 | 结果 |
+| --- | --- |
+| 清单解析 | 20 个条目、未压缩、`Microsoft.NETCore.App 8.0.0` + `WindowsDesktop 8.0.0` |
+| 注入 | `DOTNET_STARTUP_HOOKS` 成功进入引擎进程（.NET 8.0.21） |
+| 观察 | `WaitInput`、31 行、`EnterKey`，正文与按钮均为真实数据 |
+| 输入 | `act continue` 成功且观察变化 |
+| 关闭 | 进程正常退出 |
+| 数据 | 测试前移出 `Sav`/`emuera.log`，测试后还原 |
+
+曾失败并已修正的三处：`BeginInvoke` 排队超时（改由 Idle 刷新缓存）、按最新画面校验导致所有动作被判 `STALE_OBSERVATION`（改为接受最近 8 个已交付观察）、缓存早期窗口句柄（改为每次重新解析）。
+
+注意：`IsHungAppWindow` 在这个引擎上不可靠——不挂钩子直接启动同样被报为“未响应”，因此没有把它当作判据。

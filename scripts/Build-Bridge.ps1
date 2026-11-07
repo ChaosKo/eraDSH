@@ -38,6 +38,95 @@ $markerPath=Join-Path $runtime '.erabridge-runtime.json'
 if(@(Get-CimInstance Win32_Process | Where-Object {$_.ExecutablePath -eq $hostPath}).Count) { throw 'Bridge host is running; close it before rebuilding' }
 
 $sourceHash=(Get-FileHash -LiteralPath $sourceEngine -Algorithm SHA256).Hash.ToLowerInvariant()
+
+# ---------------------------------------------------------------------------
+# Bundled .NET build (Emuera.NET / Lazyloading EE): the exe carries its assemblies
+# inside an apphost, so reflection cannot load it and no mirror is useful. The
+# adapter is injected into the engine's own process as a startup hook instead.
+# ---------------------------------------------------------------------------
+if($settings.EngineKind -eq 'core') {
+ $hookProject=Join-Path $repositoryRoot 'bridge\net8\EraBridgeHook'
+ $hookPath=Join-Path $hookProject 'bin\Release\net8.0-windows\EraBridgeHook.dll'
+ if(-not(Test-Path -LiteralPath $hookPath -PathType Leaf)) {
+  $dotnet=Get-Command dotnet -ErrorAction SilentlyContinue
+  if(-not $dotnet) {
+   throw ('This engine is a bundled .NET build and needs the .NET SDK once to build its adapter. Install the .NET SDK, or build ' + $hookProject + ' elsewhere and place EraBridgeHook.dll at ' + $hookPath)
+  }
+  Write-Output 'building the .NET 8 startup-hook adapter (first use only)'
+  & dotnet build $hookProject -c Release --nologo -v q | Out-Host
+  if($LASTEXITCODE -ne 0 -or -not(Test-Path -LiteralPath $hookPath -PathType Leaf)) { throw 'Failed to build the .NET 8 startup-hook adapter' }
+ }
+ if(@(Get-CimInstance Win32_Process | Where-Object {$_.ExecutablePath -eq $sourceEngine}).Count) {
+  throw ('The engine is already running from ' + $sourceEngine + '; close it before rebuilding')
+ }
+ if($mode -ne 'inplace') {
+  Write-Warning 'A bundled .NET engine always runs from the game folder; copy mode does not apply and inplace was used.'
+  $mode='inplace'
+ }
+ $runtime=Join-Path $repositoryRoot 'runtime\host-core'
+ $hostPath=$sourceEngine
+ $markerPath=Join-Path $runtime '.erabridge-runtime.json'
+ [void](New-Item -ItemType Directory -Path $runtime -Force)
+ [ordered]@{
+  runtimeMode='inplace'
+  engineFamily='core'
+  launchMode='startup-hook'
+  gameRoot=$settings.GameRoot
+  engineExecutable=$engineName
+  engineSha256=$sourceHash
+  hookPath=$hookPath
+  createdUtc=[DateTime]::UtcNow.ToString('o')
+  bridgeVersion='0.3.0'
+ } | ConvertTo-Json | Set-Content -LiteralPath $markerPath -Encoding UTF8
+
+ $sessionId=[Guid]::NewGuid().ToString('N')
+ $artifact=Join-Path $repositoryRoot ('artifacts\bridge-'+[DateTime]::UtcNow.ToString('yyyyMMddTHHmmss')+'-'+$sessionId.Substring(0,8))
+ [void](New-Item -ItemType Directory -Path $artifact)
+ $bytes=New-Object byte[] 32
+ $rng=[Security.Cryptography.RandomNumberGenerator]::Create(); try { $rng.GetBytes($bytes) } finally {$rng.Dispose()}
+ $settingsFile=[ordered]@{
+  sessionId=$sessionId
+  pipeName=('eraDSH-'+$sessionId)
+  token=[Convert]::ToBase64String($bytes)
+  launchMode='startup-hook'
+  engineFamily='core'
+  runtimeMode='inplace'
+  hookPath=$hookPath
+  hostPath=$sourceEngine
+  enginePath=$sourceEngine
+  engineSha256=$sourceHash
+  engineExecutable=$engineName
+  gameRoot=$settings.GameRoot
+  runtimeDirectory=$runtime
+  artifactDirectory=$artifact
+  responseTimeoutSeconds=120
+ }
+ $settingsPath=Join-Path $artifact 'session.json'
+ $settingsFile | ConvertTo-Json | Set-Content -LiteralPath $settingsPath -Encoding UTF8
+ [pscustomobject]@{
+  built=$true
+  engineKind='core'
+  launchMode='startup-hook'
+  hookPath=$hookPath
+  hostPath=$sourceEngine
+  sessionFile=$settingsPath
+  artifactDirectory=$artifact
+  runtimeMode='inplace'
+  runtimeDirectory=$runtime
+  gameRoot=$settings.GameRoot
+  gameRootSource=$settings.GameRootSource
+  enginePath=$sourceEngine
+  engineExecutable=$engineName
+  engineSource=$settings.EngineSource
+  engineSha256=$sourceHash
+  engineAssemblyVersion=''
+  engineVerified=$false
+  configPath=$settings.ConfigPath
+  originalSavesCopied=$false
+ } | ConvertTo-Json
+ return
+}
+
 $assemblyVersion=$settings.EngineAssemblyVersion
 if(-not $settings.EngineVerified) {
  Write-Warning ('Engine ' + $engineName + ' is assembly version ' + $assemblyVersion + ', which this adapter has not been exercised against. Missing engine members will fail at startup with a host error.')

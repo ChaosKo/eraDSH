@@ -29,7 +29,19 @@ if($Action -eq 'open') {
  if(Test-Path -LiteralPath $instancePath) { throw 'Session already launched; use a fresh build session rather than reusing observation identity' }
  if(@(Get-CimInstance Win32_Process | Where-Object {$_.ExecutablePath -eq $settings.hostPath}).Count) { throw 'This runtime already has a bridge host' }
  $quoted='"'+$SessionFile+'"'
- $p=Start-Process -FilePath $settings.hostPath -ArgumentList $quoted -WorkingDirectory $settings.runtimeDirectory -PassThru
+ if($settings.launchMode -eq 'startup-hook') {
+  # The engine is a bundled .NET app: start it as itself, with the adapter injected
+  # through DOTNET_STARTUP_HOOKS so its apphost, dependencies and paths stay native.
+  $psi=New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName=$settings.enginePath
+  $psi.WorkingDirectory=$settings.gameRoot
+  $psi.UseShellExecute=$false
+  $psi.EnvironmentVariables['DOTNET_STARTUP_HOOKS']=$settings.hookPath
+  $psi.EnvironmentVariables['ERA_BRIDGE_SETTINGS']=$SessionFile
+  $p=[System.Diagnostics.Process]::Start($psi)
+ } else {
+  $p=Start-Process -FilePath $settings.hostPath -ArgumentList $quoted -WorkingDirectory $settings.runtimeDirectory -PassThru
+ }
  [pscustomobject]@{processId=$p.Id;startTimeUtc=$p.StartTime.ToUniversalTime().ToString('o');hostPath=$settings.hostPath;sessionId=$settings.sessionId} | ConvertTo-Json | Set-Content -LiteralPath $instancePath -Encoding UTF8
 } else { $p=Assert-HostIdentity }
 $request=[ordered]@{token=$settings.token;action=$Action;mode=$Mode;limitLines=$LimitLines}
@@ -67,7 +79,8 @@ namespace EraDSH { public static class PipePeer {
  if($json.Length -gt 32768) { throw 'Request is too large' }
  $writer.WriteLine($json);$writer.Flush()
  $read=$reader.ReadLineAsync()
- if(-not $read.Wait(40000)) { throw ('Response timed out. Do not resend the action; actionId='+$ActionId) }
+ $waitMs=if($settings.responseTimeoutSeconds){$settings.responseTimeoutSeconds*1000}else{40000}
+ if(-not $read.Wait($waitMs)) { throw ('Response timed out. Do not resend the action; actionId='+$ActionId) }
  $response=$read.Result
  if([string]::IsNullOrEmpty($response)) { throw 'Host closed without a response; inspect its artifacts, do not retry actions' }
  # Validate before publishing; no credential appears in normal results.

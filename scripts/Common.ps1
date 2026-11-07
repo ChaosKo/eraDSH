@@ -218,6 +218,7 @@ function Get-EraDshSettings {
 
  # ---- engine ----
  $engineValue = $null
+ $engineKind = $null
  $engineSource = $null
  $engineVerified = $false
  if (Test-EraDshValue $EngineExecutable) { $engineValue = $EngineExecutable; $engineSource = 'parameter' }
@@ -230,18 +231,21 @@ function Get-EraDshSettings {
    throw (New-EraDshSetupMessage -ConfigPath $resolvedConfigPath -Reason ('engineExecutable does not exist: ' + $enginePath))
   }
   $engineKind = Get-EraDshEngineKind -Path $enginePath
-  if ($engineKind -eq 'core') {
-   throw (New-EraDshUnsupportedEngineMessage -Path $enginePath -Kind $engineKind)
-  }
   if ($engineKind -eq 'native' -or $engineKind -eq 'unreadable') {
    throw ('engineExecutable is not a managed .NET assembly (' + $engineKind + '): ' + $enginePath + '.' + [Environment]::NewLine +
      'This adapter loads the engine by reflection and only drives .NET Framework Emuera builds; see docs/engine-compatibility.md.')
   }
-  $engineIdentity = [Reflection.AssemblyName]::GetAssemblyName($enginePath)
-  if ($engineIdentity.Name -ne $script:EraDshEngineAssemblyName) {
-   throw ('engineExecutable is a .NET assembly but not an Emuera build (' + $engineIdentity.Name + '): ' + $enginePath)
+  if ($engineKind -eq 'core') {
+   # A bundled .NET build has no loadable CLR header; scripts/Build-Bridge.ps1 drives
+   # it through the startup-hook adapter instead of reflection, so no version exists.
+   $engineVersion = ''
+  } else {
+   $engineIdentity = [Reflection.AssemblyName]::GetAssemblyName($enginePath)
+   if ($engineIdentity.Name -ne $script:EraDshEngineAssemblyName) {
+    throw ('engineExecutable is a .NET assembly but not an Emuera build (' + $engineIdentity.Name + '): ' + $enginePath)
+   }
+   $engineVersion = $engineIdentity.Version.ToString()
   }
-  $engineVersion = $engineIdentity.Version.ToString()
   $engineVerified = ($script:EraDshTestedEngineVersions -contains $engineVersion)
   if (Test-EraDshValue $EngineAssemblyVersion -or Test-EraDshValue $env:ERADSH_ENGINE_VERSION -or (Test-EraDshValue $file['engineAssemblyVersion'])) {
    $expected = $null
@@ -254,12 +258,14 @@ function Get-EraDshSettings {
   }
  } else {
   $discovered = @(Get-EraDshEngineCandidates -GameRoot $gameRootPath)
-  $candidates = @($discovered | Where-Object { $_.Kind -eq 'framework' })
+  # Both families are drivable now: the .NET Framework build through reflection, the
+  # bundled .NET build through the startup-hook adapter. Native tools are not engines.
+  $candidates = @($discovered | Where-Object { $_.Kind -eq 'framework' -or $_.Kind -eq 'core' })
   if ($candidates.Count -eq 0) {
    if ($discovered.Count -gt 0) {
-    throw ('No supported Emuera engine found in ' + $gameRootPath + '. Executables present:' + [Environment]::NewLine +
+    throw ('No Emuera engine found in ' + $gameRootPath + '. Executables present:' + [Environment]::NewLine +
       (Format-EraDshEngineList $discovered) + [Environment]::NewLine + [Environment]::NewLine +
-      'This adapter loads the engine by reflection, so it only drives .NET Framework Emuera builds. A .NET Core single-file build keeps its assemblies inside the executable and cannot be loaded that way. See docs/engine-compatibility.md.')
+      'Expected either a .NET Framework Emuera assembly or a bundled .NET Emuera executable. See docs/engine-compatibility.md.')
    }
    throw (New-EraDshSetupMessage -ConfigPath $resolvedConfigPath -Reason ('No executable found in ' + $gameRootPath + '.'))
   }
@@ -276,6 +282,7 @@ function Get-EraDshSettings {
   $enginePath = $chosen.Path
   $engineValue = $chosen.FileName
   $engineVersion = $chosen.Version
+  $engineKind = $chosen.Kind
   $engineVerified = $chosen.Tested
   $engineSource = 'detected'
  }
@@ -321,7 +328,7 @@ function Get-EraDshSettings {
   EngineExecutable = $engineValue
   EnginePath = $enginePath
   EngineSource = $engineSource
-  EngineAssemblyVersion = $engineVersion
+  EngineKind = $engineKind
   EngineVerified = $engineVerified
   RuntimeMode = $runtimeModeValue
   RuntimeDirectory = $runtimeValue
