@@ -2,8 +2,11 @@ name: Release
 
 on:
   push:
+    branches:
+      - main
     tags:
-      - '[0-9]*.[0-9]*.[0-9]*'
+      - '*'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -14,13 +17,14 @@ concurrency:
 
 jobs:
   publish:
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[release]')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
-      VERSION: ${{ github.ref_name }}
+      VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
       GH_REPO: ${{ github.repository }}
     steps:
-      - name: Check out tagged source
+      - name: Check out release source
         uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -28,6 +32,8 @@ jobs:
       - name: Validate release version and notes
         shell: bash
         run: |
+          VERSION="${VERSION:-$(node -p "require('./package.json').version")}"
+          export VERSION
           node --input-type=module <<'JS'
           import { readFileSync } from 'node:fs'
           const { version } = JSON.parse(readFileSync('package.json', 'utf8'))
@@ -36,6 +42,7 @@ jobs:
           }
           JS
           test -s "docs/releases/${VERSION}.md"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Publish GitHub Release
         shell: bash
