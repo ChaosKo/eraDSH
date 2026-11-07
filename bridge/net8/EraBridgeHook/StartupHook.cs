@@ -242,6 +242,10 @@ internal static class Bridge
         }
     }
 
+    // Ready means "parked on a decision", not merely "has text": a title fade-in also
+    // reports WaitInput with lines on screen, and answering there hands the caller a
+    // screen with no menu. A real stop either offers buttons, wants a value, or waits
+    // for a key without a limit timer.
     private static bool IsSteadySnapshot(Dictionary<string, object> snapshot)
     {
         if (snapshot is null) return false;
@@ -250,10 +254,21 @@ internal static class Bridge
         {
             return false;
         }
-        // A running redraw/timer is normal for these engines and never stops, so it must
-        // not gate readiness: that produced observation calls that blocked until the
-        // window was closed. Having lines to show is enough to answer.
-        return snapshot.TryGetValue("totalLines", out var lines) && Convert.ToInt32(lines) > 0;
+        if (!snapshot.TryGetValue("totalLines", out var totalLines) || Convert.ToInt32(totalLines) <= 0) return false;
+
+        if (snapshot.TryGetValue("buttons", out var buttonsValue) && buttonsValue is List<object> buttons && buttons.Count > 0)
+        {
+            return true;
+        }
+
+        if (!snapshot.TryGetValue("input", out var inputValue) || inputValue is not Dictionary<string, object> input) return false;
+        var kind = Convert.ToString(input["kind"]);
+        if (kind == "IntValue" || kind == "StrValue" || kind == "IntButton" || kind == "StrButton" || kind == "AnyValue")
+        {
+            return true;
+        }
+        var timeLimit = input.TryGetValue("timeLimit", out var limitValue) ? Convert.ToInt64(limitValue, CultureInfo.InvariantCulture) : -1L;
+        return (kind == "EnterKey" || kind == "AnyKey") && timeLimit <= 0;
     }
 
     private static string Dispatch(JsonElement request)
@@ -278,14 +293,23 @@ internal static class Bridge
                 return Json(new Dictionary<string, object> { ["ok"] = true, ["status"] = "normal_close_scheduled" });
             case "observe":
             {
-                var budget = Environment.GetEnvironmentVariable("ERA_BRIDGE_READY_MS") is { Length: > 0 } ms && int.TryParse(ms, out var parsed) ? parsed : 15000;
+                var budget = Environment.GetEnvironmentVariable("ERA_BRIDGE_READY_MS") is { Length: > 0 } ms && int.TryParse(ms, out var parsed) ? parsed : 20000;
                 var waited = System.Diagnostics.Stopwatch.StartNew();
-                // Wait on the idle-refreshed cache until the engine is in a steady input
-                // state, then build a fresh snapshot so every option is honoured.
+                // The idle-refreshed cache is only a fast path: while the engine animates,
+                // Application.Idle can stop firing and the cache freezes on an early frame.
+                // So also ask the UI thread directly for a fresh snapshot until one shows a
+                // decision screen (or the budget runs out).
                 while (waited.ElapsedMilliseconds < budget)
                 {
                     if (IsSteadySnapshot(CachedSnapshot())) break;
-                    Thread.Sleep(80);
+                    var fresh = TryFresh(request, 3000);
+                    if (fresh is not null)
+                    {
+                        _cached = fresh;
+                        _cachedAt = DateTime.UtcNow;
+                        if (IsSteadySnapshot(fresh)) break;
+                    }
+                    Thread.Sleep(100);
                 }
                 var cached = CachedSnapshot();
                 if (!IsSteadySnapshot(cached))
@@ -530,30 +554,6 @@ internal static class Bridge
         return fresh ? cached : null;
     }
 
-    private static Dictionary<string, object> Snapshot(JsonElement request)
-    {
-        var options = new Dictionary<string, object>
-        {
-            ["mode"] = GetString(request, "mode") is { Length: > 0 } mode ? mode : "text",
-        };
-        if (request.TryGetProperty("limitLines", out var limit)) options["limitLines"] = limit.GetInt32();
-        if (request.TryGetProperty("fromLine", out var from)) options["fromLine"] = from.GetInt32();
-        if (request.TryGetProperty("includeLines", out var includeLines) &&
-            (includeLines.ValueKind == JsonValueKind.True || includeLines.ValueKind == JsonValueKind.False))
-        {
-            options["includeLines"] = includeLines.GetBoolean();
-        }
-        var noise = GetString(request, "noise");
-        if (noise.Length > 0) options["noise"] = noise;
-        var since = GetString(request, "sinceObservationId");
-        if (since.Length > 0) options["since"] = since;
-        if (request.TryGetProperty("sinceCursor", out var sinceCursor) && sinceCursor.ValueKind == JsonValueKind.Number)
-        {
-            options["cursor"] = sinceCursor.GetInt64();
-        }
-        return OnUi(() => SnapshotCore(options));
-    }
-
     // Era engines print a wall of loading chatter at startup. The wording is
     // localized ("読み込み中", "读取 ABL.CSV 中", "Loading ..."), so a line counts as
     // noise when it names a script/data file AND carries a progress word, or when it
@@ -599,6 +599,36 @@ internal static class Bridge
         return first + " ×" + t.Length.ToString(CultureInfo.InvariantCulture);
     }
 
+    private static Dictionary<string, object> OptionsFrom(JsonElement request)
+    {
+        var options = new Dictionary<string, object>
+        {
+            ["mode"] = GetString(request, "mode") is { Length: > 0 } mode ? mode : "text",
+        };
+        if (request.TryGetProperty("limitLines", out var limit)) options["limitLines"] = limit.GetInt32();
+        if (request.TryGetProperty("fromLine", out var from)) options["fromLine"] = from.GetInt32();
+        if (request.TryGetProperty("includeLines", out var includeLines) &&
+            (includeLines.ValueKind == JsonValueKind.True || includeLines.ValueKind == JsonValueKind.False))
+        {
+            options["includeLines"] = includeLines.GetBoolean();
+        }
+        var noise = GetString(request, "noise");
+        if (noise.Length > 0) options["noise"] = noise;
+        var since = GetString(request, "sinceObservationId");
+        if (since.Length > 0) options["since"] = since;
+        if (request.TryGetProperty("sinceCursor", out var sinceCursor) && sinceCursor.ValueKind == JsonValueKind.Number)
+        {
+            options["cursor"] = sinceCursor.GetInt64();
+        }
+        return options;
+    }
+
+    private static Dictionary<string, object> Snapshot(JsonElement request)
+    {
+        var options = OptionsFrom(request);
+        return OnUi(() => SnapshotCore(options));
+    }
+
     private static Dictionary<string, object> SnapshotCore(Dictionary<string, object> options)
     {
         if (_console is null) throw new InvalidOperationException("engine console is not attached yet");
@@ -626,6 +656,7 @@ internal static class Bridge
             }
         }
         catch { }
+        if (deletedLines < 0) deletedLines = 0;
 
         var start = Math.Max(0, allLines.Count - limit);
         if (options.TryGetValue("fromLine", out var fromValue)) start = Math.Max(0, Math.Min(allLines.Count, Convert.ToInt32(fromValue)));
@@ -1063,6 +1094,30 @@ internal static class Bridge
             return Error("OUTCOME_UNCERTAIN", "UI operation is running; do not repeat the action");
         }
         if (failure != null) return Error("ENGINE_ERROR", Root(failure).Message);
+        return result;
+    }
+
+    // Bounded snapshot attempt used while waiting for a decision screen. Returns null
+    // when the UI thread does not answer, so the caller can try again instead of
+    // failing the whole request or blocking on a frozen idle cache.
+    private static Dictionary<string, object> TryFresh(JsonElement request, int timeoutMs)
+    {
+        if (_window is null || _window.IsDisposed || _console is null) { RefreshTargets(); return null; }
+        Dictionary<string, object> result = null;
+        Exception failure = null;
+        using var done = new ManualResetEventSlim();
+        try
+        {
+            _window.BeginInvoke((Action)(() =>
+            {
+                var options = OptionsFrom(request);
+                try { result = SnapshotCore(options); }
+                catch (Exception ex) { failure = ex; }
+                finally { done.Set(); }
+            }));
+        }
+        catch { return null; }
+        if (!done.Wait(timeoutMs) || result is null || failure != null) return null;
         return result;
     }
 

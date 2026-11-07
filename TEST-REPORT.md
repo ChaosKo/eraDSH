@@ -441,3 +441,22 @@ bundle patch 从一行扩到两行：除 `dsh-era-bridge` 外，新增一条 `@d
 实测（`eraOCG2`）：修复前 `open` 需等到窗口关闭；修复后 **11.2 秒**返回 `WaitInput`、31 行、`pending` 为空；把上限临时调到 5 秒时如实返回 `state=Initializing, pending=true`，不会挂住。
 
 补充：`dsh plugin` 子命令必须显式带 `--profile <名字>`，否则直接报 `required option '--profile <name>' not specified`（本机实测）。README 的安装、升级与本地开发三处命令已统一为 `dsh plugin --profile web …`。
+
+### 8.19 修复 open 卡住与"未响应"（2026-11-08 00:35）
+
+两个接连的缺陷，都出在钩子的 observe 等待逻辑：
+
+| 缺陷 | 现象 | 原因 | 修法 |
+| --- | --- | --- | --- |
+| 缓存冻结 | 前台已显示标题菜单，`open` 仍不返回 | 就绪判定只读 `Application.Idle` 刷新的缓存；引擎动画期间 Idle 不再触发，缓存停在没有按钮的淡入帧 | 判定失败时主动向 UI 线程要一次新快照（3 秒上限），取不到再等 |
+| 嵌套 BeginInvoke | 加了上一条后引擎**未响应** | 新快照走了 `Snapshot()`，而它内部又调用一次 `OnUi`→`BeginInvoke`，UI 线程等自己 | 抽出 `OptionsFrom()`，新快照直接调 `SnapshotCore`，不再嵌套 |
+
+实测（每次都是 build → open → act → close 一条链路）：
+
+| 引擎 | open | 首屏按钮 | act |
+| --- | --- | --- | --- |
+| `eraOCG2` | 12.5 s | 3（开始游戏/读取存档/CSV编辑器） | 成功，画面变为 2 按钮确认框 |
+| `eraFL` | 5.7 s | 6 | 成功，变为 4 按钮 |
+| `eraTW`（x86） | 8.7 s | 3 | 成功，变为 2 按钮 |
+
+经验：缓存只能当快速路径，判定必须能主动取真值；而在 UI 线程上执行的回调里绝不能再 `BeginInvoke`。

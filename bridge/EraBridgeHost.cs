@@ -332,6 +332,7 @@ namespace EraDSH {
    var deletedProperty=ConsoleObject.GetType().GetProperty("DeletedLines",Members);
    if(deletedProperty!=null)deletedLines=Convert.ToInt64(deletedProperty.GetValue(ConsoleObject,null)??0L,CultureInfo.InvariantCulture);
    else { var deletedField=ConsoleObject.GetType().GetField("deletedLines",Members); if(deletedField!=null)deletedLines=Convert.ToInt64(deletedField.GetValue(ConsoleObject)??0L,CultureInfo.InvariantCulture); }
+   if(deletedLines<0)deletedLines=0;
    bool cursorExpired=false;
    if(request.ContainsKey("sinceCursor")) {
     var requested=Convert.ToInt64(request["sinceCursor"],CultureInfo.InvariantCulture);
