@@ -420,7 +420,7 @@ bundle patch 从一行扩到两行：除 `dsh-era-bridge` 外，新增一条 `@d
 | `install_bundle`（目标=仓库根） | `application: applied`，版本 0.2.0，`link:C:/Data/Game/Eras/eraDSH` |
 | 行注册 | `dsh-era-bridge` 与 `preset-era` 均在，`Config` 可见 `include:preset-era` |
 
-文档：README 收缩为面向使用者的一页（能力、依赖、`dsh plugin add github:ChaosKo/eraDSH` 安装、三分钟上手、配置与索引），技术内容拆到新增的 [docs/architecture.md](docs/architecture.md)（组件、两种宿主、协议字段、错误码、限额）与 [docs/engine-detection.md](docs/engine-detection.md)（引擎分类与选择顺序、运行时要求）。README 旧锚点 `#两种运行方式` 已不存在，`docs/observation-cost.md` 中的链接改指 architecture。
+文档：README 收缩为面向使用者的一页（能力、依赖、`dsh plugin --profile web add github:ChaosKo/eraDSH` 安装、三分钟上手、配置与索引），技术内容拆到新增的 [docs/architecture.md](docs/architecture.md)（组件、两种宿主、协议字段、错误码、限额）与 [docs/engine-detection.md](docs/engine-detection.md)（引擎分类与选择顺序、运行时要求）。README 旧锚点 `#两种运行方式` 已不存在，`docs/observation-cost.md` 中的链接改指 architecture。
 
 说明：GitHub 安装路径按 `dsh plugin` 行为（转发 pnpm，启动时自动登记声明了 `dsh.bundle` 的新依赖）写入文档，未在本机实际执行，以免替换当前的本地链接安装。
 
@@ -439,3 +439,5 @@ bundle patch 从一行扩到两行：除 `dsh-era-bridge` 外，新增一条 `@d
 | 超时行为 | 返回当前画面并标 `pending: true` + `observationAgeMs`，不再空等 |
 
 实测（`eraOCG2`）：修复前 `open` 需等到窗口关闭；修复后 **11.2 秒**返回 `WaitInput`、31 行、`pending` 为空；把上限临时调到 5 秒时如实返回 `state=Initializing, pending=true`，不会挂住。
+
+补充：`dsh plugin` 子命令必须显式带 `--profile <名字>`，否则直接报 `required option '--profile <name>' not specified`（本机实测）。README 的安装、升级与本地开发三处命令已统一为 `dsh plugin --profile web …`。

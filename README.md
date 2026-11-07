@@ -31,10 +31,12 @@
 
 ## 安装
 
+> `dsh plugin` 必须带 `--profile <名字>`，否则会直接报 `required option '--profile <name>' not specified`。下面的命令以 `web` 为例；名字就是 `DSH_PROFILE` 环境变量的值（在 DSH 会话里执行 `$env:DSH_PROFILE` 可查）。
+
 ### 作为 DSH 插件（从 GitHub）
 
 ```powershell
-dsh plugin add github:ChaosKo/eraDSH
+dsh plugin --profile web add github:ChaosKo/eraDSH
 ```
 
 装完后重启 `dsh web`。启动时 DSH 会把声明了 `dsh.bundle` 的新依赖自动登记为 profile 的一个 bundle（也可以在 Web UI 的插件管理里确认它已启用）。
@@ -42,17 +44,17 @@ dsh plugin add github:ChaosKo/eraDSH
 升级到新版本：
 
 ```powershell
-dsh plugin remove dsh-era-bridge
-dsh plugin add github:ChaosKo/eraDSH
+dsh plugin --profile web remove dsh-era-bridge
+dsh plugin --profile web add github:ChaosKo/eraDSH
 ```
 
 ### 本地开发
 
 ```powershell
-dsh plugin add C:\path\to\eraDSH
+dsh plugin --profile web add C:\path\to\eraDSH
 ```
 
-链接安装后改代码即时生效；`index.js` 之类的 Host 代码改动需要重启一次 `dsh web`。
+链接安装后改代码即时生效；`index.js` 之类的 Host 代码改动需要重启一次 `dsh web`。改动 `bridge/net8/EraBridgeHook` 后必须重装一次（或让构建重新编译），因为注入用的 DLL 是构建产物。
 
 ### 不用插件
 
