@@ -31,14 +31,15 @@
 
                 # 工具：era_bridge
 
-                五个动作，一次调用只做一件事：
+                六个动作，一次调用只做一件事：
+                - build：为某个游戏目录准备一局会话，返回 sessionFile。构建脚本随插件分发，不需要也不能去找仓库。
                 - open：启动实例并返回首个观察。同一会话不要重复 open。
                 - status：确认实例是否还活着；长时间停顿后先 status 再 act。
                 - observe：读取当前状态。mode=text 取正文与按钮，visual 取截图，both 两者都要，auto 目前等同 both。
                 - act：提交一次输入。kind=choose 按按钮并给 choiceId；kind=input 提交 value；kind=continue 回应 EnterKey 或 AnyKey 等待。
                 - close：正常关闭实例。自主游玩过程中不要调用，结束时用它收尾。
 
-                每个动作都要带 sessionFile，就是 Build-Bridge.ps1 产出的 session.json 绝对路径。还没有会话时，在工作区的 eraDSH 仓库里运行 pwsh -File scripts/Build-Bridge.ps1 -GameRoot 游戏目录，再从返回结果里取 sessionFile。游戏目录必须与仓库目录不同，相同会直接报错。
+                开始一局之前先建会话：调用 era_bridge 的 build 动作，传游戏目录的绝对路径，例如 action="build"、gameRoot="D:/Games/SomeEraGame"。脚本随插件安装，**不要在工作区里找 eraDSH 仓库，也不要自己拼脚本路径**；不知道游戏目录就问用户。建好之后其余动作可以省略 sessionFile，工具会记住最近一次构建的会话；游戏目录不能是插件仓库本身，脚本会拒绝。
 
                 观察与动作规则：
                 - act 必须带最近一次观察的 observationId。旧 ID 会被 STALE_OBSERVATION 拒绝，重新 observe 即可，不要拿旧 ID 硬试。

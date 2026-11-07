@@ -59,7 +59,7 @@ if($mode -eq 'inplace') {
   engineSha256=$sourceHash
   engineAssemblyVersion=$assemblyVersion
   createdUtc=[DateTime]::UtcNow.ToString('o')
-  bridgeVersion='0.1.0'
+  bridgeVersion='0.2.0'
  }
  $marker | ConvertTo-Json | Set-Content -LiteralPath $markerPath -Encoding UTF8
 } else {
@@ -90,7 +90,7 @@ if($mode -eq 'inplace') {
    engineSha256=$sourceHash
    engineAssemblyVersion=$assemblyVersion
    createdUtc=[DateTime]::UtcNow.ToString('o')
-   bridgeVersion='0.1.0'
+   bridgeVersion='0.2.0'
   }
   $marker | ConvertTo-Json | Set-Content -LiteralPath $markerPath -Encoding UTF8
  }

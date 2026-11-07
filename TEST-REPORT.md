@@ -298,3 +298,18 @@ bundle patch 从一行扩到两行：除 `dsh-era-bridge` 外，新增一条 `@d
 
 清理：临时副本与 `runtime/verify-copy` 已删除，真实游戏目录未被本项验证接触。
 
+### 8.9 自包含的建会话动作（2026-11-07 21:41–21:43）
+
+问题：`era_bridge` 的五个动作都需要现成的 `session.json`，而生成它只能靠手跑 `Build-Bridge.ps1`，所以 Era 模式下的 Agent 会去工作区里找 `eraDSH` 仓库。插件的脚本本来就随包分发，工具也已经用自身包目录解析 `scripts/Invoke-Bridge.ps1`，缺的只是把构建这一步也交给工具。
+
+| 检查 | 结果 |
+| --- | --- |
+| 新增 `build` 动作 | 以插件包目录解析 `scripts/Build-Bridge.ps1`，参数为 `gameRoot` / `engineExecutable` / `runtimeMode` / `recreate` |
+| 会话记忆 | 构建结果写入 `%DSH_HOME%\era-bridge\last-session.json`；`DSH_HOME` 未导出时回退到 `%USERPROFILE%\.dsh` |
+| 省略 `sessionFile` | build 之后 open / observe / act / close 直接可用，实测 open 返回 28 行 + 4 按钮 |
+| 错误提示 | 没有会话时提示先调用 `build`，不再要求调用方去找仓库 |
+| persona | 改为「不要在工作区里找 eraDSH 仓库，也不要自己拼脚本路径；不知道游戏目录就问用户」 |
+| 包内状态 | 首次验证时状态文件误落到仓库 `.era-bridge-state/`，已改为回退到用户主目录，并把该目录加入忽略规则 |
+
+验证环境：22 MB 临时副本（`_tool-test`），验证后删除；`runtime/host` 一并清理，下次构建重新生成。版本号升至 0.2.0，运行目录标记同步。
+

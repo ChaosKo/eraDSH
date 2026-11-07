@@ -1,19 +1,33 @@
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 
 export const name = 'dsh-era-bridge'
 export const inject = ['tools']
 
+// Everything the tool runs ships inside this package, so the plugin never depends
+// on the checkout's location and never has to be told where a repository is.
 const here = dirname(fileURLToPath(import.meta.url))
-const defaultScript = resolve(here, 'scripts', 'Invoke-Bridge.ps1')
+const clientScript = resolve(here, 'scripts', 'Invoke-Bridge.ps1')
+const buildScript = resolve(here, 'scripts', 'Build-Bridge.ps1')
 const systemRoot = process.env.SystemRoot ?? process.env.WINDIR ?? 'C:\\Windows'
 const defaultPowerShell = join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
 
-const ACTIONS = ['open', 'status', 'observe', 'act', 'close']
+// The last session built through this tool, remembered per DSH home so a caller
+// can keep acting after a turn boundary without re-passing sessionFile. The DSH
+// host process does not always export DSH_HOME, so fall back to the default home.
+const dshHome = process.env.DSH_HOME && process.env.DSH_HOME.length > 0
+  ? process.env.DSH_HOME
+  : join(homedir(), '.dsh')
+const stateRoot = join(dshHome, 'era-bridge')
+const stateFile = join(stateRoot, 'last-session.json')
 
-function runClient({ powershell, script, args }) {
+const ACTIONS = ['build', 'open', 'status', 'observe', 'act', 'close']
+const RUNTIME_MODES = ['inplace', 'copy']
+
+function run({ powershell, script, args }) {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(powershell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, ...args], {
       windowsHide: true,
@@ -38,20 +52,52 @@ function parseSoleJson(stdout) {
   return JSON.parse(text.slice(start, end + 1))
 }
 
+function readRememberedSession() {
+  try {
+    if (!existsSync(stateFile)) return undefined
+    const parsed = JSON.parse(readFileSync(stateFile, 'utf8'))
+    if (typeof parsed.sessionFile !== 'string' || !parsed.sessionFile) return undefined
+    if (!existsSync(parsed.sessionFile)) return undefined
+    return parsed.sessionFile
+  } catch {
+    return undefined
+  }
+}
+
+function rememberSession(result) {
+  try {
+    mkdirSync(stateRoot, { recursive: true })
+    writeFileSync(stateFile, JSON.stringify({
+      sessionFile: result.sessionFile,
+      gameRoot: result.gameRoot,
+      runtimeMode: result.runtimeMode,
+      builtAt: new Date().toISOString(),
+    }, null, 2))
+  } catch {
+    // Remembering is a convenience; a read-only home must not fail the build.
+  }
+}
+
 export function apply(ctx, config = {}) {
-  const script = isAbsolute(config.scriptPath ?? '') ? config.scriptPath : defaultScript
+  const script = isAbsolute(config.scriptPath ?? '') ? config.scriptPath : clientScript
+  const builder = isAbsolute(config.buildScriptPath ?? '') ? config.buildScriptPath : buildScript
   const powershell = isAbsolute(config.powershellPath ?? '') ? config.powershellPath : defaultPowerShell
   const configuredSession = typeof config.sessionFile === 'string' && config.sessionFile.length > 0 ? config.sessionFile : undefined
+  const defaultRuntimeMode = RUNTIME_MODES.includes(config.runtimeMode) ? config.runtimeMode : 'inplace'
 
   ctx.effect(() => ctx.tools.register({
     name: 'era_bridge',
     description:
-      'Read or control a managed Era game through the local eraDSH bridge. Always observe before acting: act requires the observation id from the latest observation, and the bridge rejects stale, duplicate, or malformed actions. Text comes from the engine display buffer; screenshots are saved as files and must be viewed separately.',
+      'Build a session and read or control a managed Era game through the local eraDSH bridge. Start with action=build (gameRoot is the Era game folder); every other action then works without sessionFile because the last build is remembered. Always observe before acting: act requires the observation id from the latest observation, and the bridge rejects stale, duplicate, or malformed actions. Text comes from the engine display buffer; screenshots are saved as files and must be viewed separately.',
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ACTIONS, description: 'open launches the managed instance; observe reads state; act submits one input; status reports liveness; close shuts the managed instance down cleanly.' },
-        sessionFile: { type: 'string', description: 'Absolute path to a session.json produced by Build-Bridge.ps1. Falls back to the plugin configuration when omitted.' },
+        action: { type: 'string', enum: ACTIONS, description: 'build prepares a session for a game folder; open launches the managed instance; observe reads state; act submits one input; status reports liveness; close shuts the managed instance down cleanly.' },
+        gameRoot: { type: 'string', description: 'Absolute path of the Era game folder. Required by build; the scripts that operate it ship inside this plugin, so no repository path is ever needed.' },
+        engineExecutable: { type: 'string', description: 'Optional launcher file name inside gameRoot; omitted, the engine is detected automatically.' },
+        runtimeMode: { type: 'string', enum: RUNTIME_MODES, description: 'inplace (default) runs the engine from the game folder and copies nothing; copy mirrors the folder into the plugin runtime directory first.' },
+        recreate: { type: 'boolean', description: 'build only: discard and rebuild an existing runtime directory.' },
+        sessionFile: { type: 'string', description: 'Absolute path to a session.json. Falls back to the plugin configuration, then to the session this tool built last.' },
         mode: { type: 'string', enum: ['text', 'visual', 'both', 'auto'], description: 'Observation content. auto currently behaves like both.' },
         limitLines: { type: 'integer', minimum: 1, maximum: 200, description: 'Maximum display-buffer lines to return.' },
         fromLine: { type: 'integer', minimum: 0, description: 'Zero-based display-buffer line to start from; omit for the newest page.' },
@@ -71,8 +117,31 @@ export function apply(ctx, config = {}) {
     async execute(args) {
       const action = String(args.action ?? '')
       if (!ACTIONS.includes(action)) throw new Error(`Unsupported era_bridge action: ${action}`)
-      const sessionFile = args.sessionFile ?? configuredSession
-      if (!sessionFile) throw new Error('era_bridge needs sessionFile (no default configured)')
+
+      if (action === 'build') {
+        const gameRoot = String(args.gameRoot ?? '')
+        if (!gameRoot) throw new Error('build requires gameRoot: the absolute path of the Era game folder')
+        if (!isAbsolute(gameRoot)) throw new Error('gameRoot must be an absolute path')
+        if (!existsSync(gameRoot) || !statSync(gameRoot).isDirectory()) throw new Error(`gameRoot is not a directory: ${gameRoot}`)
+        if (!existsSync(builder)) throw new Error(`Bridge build script not found: ${builder}`)
+
+        const cli = ['-GameRoot', gameRoot, '-RuntimeMode', String(args.runtimeMode ?? defaultRuntimeMode)]
+        if (args.engineExecutable) cli.push('-EngineExecutable', String(args.engineExecutable))
+        if (args.recreate === true) cli.push('-Recreate')
+
+        const { code, stdout, stderr } = await run({ powershell, script: builder, args: cli })
+        if (code !== 0) {
+          const detail = (stderr.trim() || stdout.trim() || 'no diagnostic output').slice(0, 2000)
+          throw new Error(`era_bridge build failed (exit ${code}): ${detail}`)
+        }
+        const built = parseSoleJson(stdout)
+        if (!built.sessionFile) throw new Error('era_bridge build returned no sessionFile')
+        rememberSession(built)
+        return built
+      }
+
+      const sessionFile = args.sessionFile ?? configuredSession ?? readRememberedSession()
+      if (!sessionFile) throw new Error('era_bridge has no session yet: call action="build" with gameRoot first')
       if (!isAbsolute(sessionFile)) throw new Error('sessionFile must be an absolute path')
       if (!existsSync(sessionFile)) throw new Error(`sessionFile does not exist: ${sessionFile}`)
       if (!existsSync(script)) throw new Error(`Bridge client script not found: ${script}`)
@@ -90,7 +159,7 @@ export function apply(ctx, config = {}) {
         if (args.actionId) cli.push('-ActionId', String(args.actionId))
       }
 
-      const { code, stdout, stderr } = await runClient({ powershell, script, args: cli })
+      const { code, stdout, stderr } = await run({ powershell, script, args: cli })
       if (code !== 0) {
         const detail = stderr.trim() || stdout.trim() || 'no diagnostic output'
         throw new Error(`era_bridge client failed (exit ${code}): ${detail.slice(0, 2000)}`)
