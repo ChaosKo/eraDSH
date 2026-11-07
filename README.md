@@ -220,6 +220,7 @@ artifacts/bridge-*/   会话信息、观察、截图、审计、测试结果
 
 - [`PLAN.md`](PLAN.md) — 策划案与阶段划分
 - [`TEST-REPORT.md`](TEST-REPORT.md) — 实测报告、失败记录与更正
+- [`docs/observation-cost.md`](docs/observation-cost.md) — 显示缓冲、返回体与落盘成本实测
 - [`legacy/README.md`](legacy/README.md) — 历史探针说明
 - [`tests/README.md`](tests/README.md) — 测试脚本说明
 

@@ -14,6 +14,7 @@ $build = ..\scripts\Build-Bridge.ps1 | ConvertFrom-Json
 | `Test-BridgeBounds.ps1` | Synthetic limits: text budget, button cap, generation filtering, stale buttons | yes (32-bit PowerShell) |
 | `Test-TitleCredits.ps1` | Title-screen credits toggle, replay protection, restore | no — encodes one game's menu values |
 | `Test-NewGamePath.ps1` | Title → new game → setup → prologue → main screen | no — encodes one game's flow |
+| `Measure-ObservationCost.ps1` | Display-buffer growth, per-step response size, audit growth | no — encodes one game's menu values |
 
 The last two are kept because they are the evidence behind
 [TEST-REPORT.md](../TEST-REPORT.md). They assert button values that only exist
