@@ -329,6 +329,7 @@ function Get-EraDshSettings {
   EnginePath = $enginePath
   EngineSource = $engineSource
   EngineKind = $engineKind
+  EngineAssemblyVersion = $engineVersion
   EngineVerified = $engineVerified
   RuntimeMode = $runtimeModeValue
   RuntimeDirectory = $runtimeValue

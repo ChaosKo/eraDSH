@@ -229,6 +229,8 @@ $settingsFile | ConvertTo-Json | Set-Content -LiteralPath $settingsPath -Encodin
 
 [pscustomobject]@{
  built=$true
+ engineKind='framework'
+ launchMode='reflection'
  hostPath=$hostPath
  sessionFile=$settingsPath
  artifactDirectory=$artifact

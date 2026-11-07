@@ -10,7 +10,11 @@
 // host, so scripts/Invoke-Bridge.ps1 and the era_bridge tool work unchanged.
 
 using System.Collections;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Globalization;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Security.Principal;
@@ -55,6 +59,28 @@ internal static class Bridge
     private static readonly Queue<string> RecentOrder = new();
     private static DateTime _cachedAt = DateTime.MinValue;
     private static string _failure;
+    private static int _imageNumber;
+
+    [DllImport("user32.dll")]
+    private static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetWindowRect(IntPtr hWnd, out Rect lpRect);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetClientRect(IntPtr hWnd, out Rect lpRect);
+
+    [DllImport("user32.dll")]
+    private static extern bool ClientToScreen(IntPtr hWnd, ref Point lpPoint);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsIconic(IntPtr hWnd);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Rect
+    {
+        public int Left, Top, Right, Bottom;
+    }
 
     internal static void LogFailure(Exception ex)
     {
@@ -95,32 +121,27 @@ internal static class Bridge
     {
         if (_console != null)
         {
-            try { _cached = SnapshotCore(new Dictionary<string, object> { ["mode"] = "text", ["limitLines"] = 200 }); _cachedAt = DateTime.UtcNow; }
+            try
+            {
+                RefreshTargets();
+                _cached = SnapshotCore(new Dictionary<string, object> { ["mode"] = "text", ["limitLines"] = 200 });
+                _cachedAt = DateTime.UtcNow;
+            }
             catch { }
             return;
         }
         try
         {
-            Form found = null;
-            foreach (Form form in Application.OpenForms)
+            if (RefreshTargets())
             {
-                var name = form.GetType().FullName ?? string.Empty;
-                if (name.EndsWith("Forms.MainWindow", StringComparison.Ordinal) ||
-                    name.EndsWith("MinorShift.Emuera.MainWindow", StringComparison.Ordinal))
+                Record("ready", new { window = _window.GetType().FullName, title = _window.Text, console = _consoleType.FullName });
+                try
                 {
-                    found = form;
-                    break;
+                    _cached = SnapshotCore(new Dictionary<string, object> { ["mode"] = "text", ["limitLines"] = 200 });
+                    _cachedAt = DateTime.UtcNow;
                 }
+                catch { }
             }
-            if (found is null) return;
-
-            var console = found.GetType().GetField("console", AnyInstance)?.GetValue(found);
-            if (console is null) return;
-
-            _window = found;
-            _console = console;
-            _consoleType = console.GetType();
-            Record("ready", new { window = found.GetType().FullName, title = found.Text, console = _consoleType.FullName });
         }
         catch (Exception ex)
         {
@@ -221,6 +242,29 @@ internal static class Bridge
         }
     }
 
+    private static bool IsSteadySnapshot(Dictionary<string, object> snapshot)
+    {
+        if (snapshot is null) return false;
+        var state = Convert.ToString(snapshot["state"]);
+        if (string.IsNullOrEmpty(state) || state == "Initializing" || state == "Running" || state == "Sleep")
+        {
+            return false;
+        }
+        // Short TWAIT/TINPUT fade loops (e.g. OCG2 title fade-in) set timeLimit > 0 and run a timer
+        // while NeedValue is false; wait for them to finish so observe lands on the real menu.
+        if (snapshot.TryGetValue("input", out var inputObj) && inputObj is Dictionary<string, object> input)
+        {
+            var timeLimit = input.TryGetValue("timeLimit", out var tl) ? Convert.ToInt64(tl, CultureInfo.InvariantCulture) : -1;
+            var needValue = input.TryGetValue("needValue", out var nv) && nv is bool b && b;
+            var runningTimer = input.TryGetValue("runningTimer", out var rt) && rt is bool rtb && rtb;
+            if ((runningTimer || (timeLimit > 0 && timeLimit <= 2000)) && !needValue)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private static string Dispatch(JsonElement request)
     {
         var action = GetString(request, "action");
@@ -243,17 +287,25 @@ internal static class Bridge
                 return Json(new Dictionary<string, object> { ["ok"] = true, ["status"] = "normal_close_scheduled" });
             case "observe":
             {
-                // Wait for the first real screen by polling the idle-refreshed cache;
-                // queueing on the message loop is not reliable while the engine loads.
                 var budget = Environment.GetEnvironmentVariable("ERA_BRIDGE_READY_MS") is { Length: > 0 } ms && int.TryParse(ms, out var parsed) ? parsed : 120000;
                 var waited = System.Diagnostics.Stopwatch.StartNew();
                 while (waited.ElapsedMilliseconds < budget)
                 {
-                    var snapshot = CachedSnapshot();
-                    if (snapshot != null && !string.Equals(Convert.ToString(snapshot["state"]), "Initializing", StringComparison.Ordinal)) return Json(snapshot);
-                    Thread.Sleep(100);
+                    var cached = CachedSnapshot();
+                    if (IsSteadySnapshot(cached))
+                    {
+                        var mode = GetString(request, "mode");
+                        var hasCustomSlice = request.TryGetProperty("fromLine", out _) ||
+                            (request.TryGetProperty("limitLines", out var ll) && ll.GetInt32() != 200);
+                        if ((string.IsNullOrEmpty(mode) || mode == "text") && !hasCustomSlice)
+                        {
+                            return Json(cached);
+                        }
+                        return Json(Snapshot(request));
+                    }
+                    Thread.Sleep(80);
                 }
-                return Json(CachedSnapshot() ?? Error("NOT_READY", "engine did not reach an input state in time"));
+                return Json(CachedSnapshot() ?? Error("NOT_READY", "engine did not reach a steady input state in time"));
             }
             case "act":
                 return Act(request);
@@ -313,13 +365,9 @@ internal static class Bridge
 
     private static Dictionary<string, object> ActCore(JsonElement request, string actionId)
     {
-        // Validate against the observation the caller actually received; the live
-        // screen may already have moved on, which would make every act look stale.
         var claimed = GetString(request, "observationId");
         Dictionary<string, object> known;
         lock (Recent) Recent.TryGetValue(claimed, out known);
-        // Accept any observation this session actually delivered, so a screen that
-        // animates between the read and the action is not reported as stale.
         if (known is null)
         {
             var fallback = CachedSnapshot();
@@ -356,7 +404,10 @@ internal static class Bridge
         }
         else if (kind == "continue")
         {
-            if (inputKind != "EnterKey" && inputKind != "AnyKey") return Error("WRONG_INPUT_KIND", "Continue requires an EnterKey/AnyKey request");
+            if (inputKind != "EnterKey" && inputKind != "AnyKey" && inputKind != "PrimitiveMouseKey")
+            {
+                return Error("WRONG_INPUT_KIND", "Continue requires an EnterKey/AnyKey request");
+            }
             value = string.Empty;
         }
         else if (kind != "input")
@@ -368,16 +419,25 @@ internal static class Bridge
         {
             return Error("INVALID_INPUT", "Input is bounded single-line text; debug commands are not exposed");
         }
-        if (inputKind == "IntValue" && !long.TryParse(value, out _))
+        if ((inputKind == "IntValue" || inputKind == "IntButton") && !long.TryParse(value, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out _))
         {
             return Error("INTEGER_REQUIRED", "Current request expects an integer");
+        }
+        if (kind != "continue" && inputKind != "IntValue" && inputKind != "IntButton" && inputKind != "StrValue" && inputKind != "StrButton" && inputKind != "AnyValue")
+        {
+            return Error("WRONG_INPUT_KIND", "Use continue for key waits");
         }
 
         var press = _consoleType.GetMethod("PressEnterKey", AnyInstance, null, new[] { typeof(bool), typeof(string), typeof(bool) }, null);
         if (press is null) return Error("ADAPTER_MEMBER_MISSING", "EmueraConsole.PressEnterKey(bool,string,bool) is absent in this build");
         press.Invoke(_console, new object[] { false, value, false });
 
-        var after = SnapshotCore(new Dictionary<string, object> { ["mode"] = "text", ["limitLines"] = 80 });
+        var mode = GetString(request, "mode") is { Length: > 0 } m ? m : "text";
+        var limit = request.TryGetProperty("limitLines", out var ll) ? ll.GetInt32() : 80;
+        var after = SnapshotCore(new Dictionary<string, object> { ["mode"] = mode, ["limitLines"] = limit });
+        _cached = after;
+        _cachedAt = DateTime.UtcNow;
+
         return new Dictionary<string, object>
         {
             ["ok"] = true,
@@ -389,9 +449,6 @@ internal static class Bridge
         };
     }
 
-    // Observation is served from the snapshot the UI thread refreshes on idle: a
-    // request thread must not wait for the message loop, which can be busy for a
-    // long time while the engine loads its data.
     private static Dictionary<string, object> CachedSnapshot()
     {
         var cached = _cached;
@@ -419,9 +476,8 @@ internal static class Bridge
         if (limit < 1 || limit > 200) throw new ArgumentOutOfRangeException(nameof(limit), "Use 1..200");
 
         var linesProperty = _consoleType.GetProperty("DisplayLineList", AnyInstance);
-        var allLines = (IList)linesProperty?.GetValue(_console);
         if (linesProperty is null) throw new InvalidOperationException("DisplayLineList is absent in this build");
-        if (allLines is null) allLines = new List<object>();
+        var allLines = (IList)linesProperty.GetValue(_console) ?? new List<object>();
 
         var start = Math.Max(0, allLines.Count - limit);
         if (options.TryGetValue("fromLine", out var fromValue)) start = Math.Max(0, Math.Min(allLines.Count, Convert.ToInt32(fromValue)));
@@ -431,27 +487,66 @@ internal static class Bridge
         var input = DescribeInput(request);
         var needValue = input.TryGetValue("needValue", out var nv) && nv is bool b && b;
 
-        var currentGeneration = 0;
-        var newGeneration = Convert.ToInt32(_consoleType.GetField("newButtonGeneration", AnyInstance)?.GetValue(_console) ?? 0);
+        // First pass across all display lines: determine the latest button generation on screen,
+        // matching EraBridgeHost.cs semantics (newButtonGeneration is the *next* generation counter).
+        long currentGeneration = 0;
+        for (var idx = 0; idx < allLines.Count; idx++)
+        {
+            var lineObj = allLines[idx];
+            var arr = lineObj?.GetType().GetProperty("Buttons", AnyInstance)?.GetValue(lineObj) as Array;
+            if (arr is null) continue;
+            for (var bi = 0; bi < arr.Length; bi++)
+            {
+                var btn = arr.GetValue(bi);
+                if (btn is null) continue;
+                var bt = btn.GetType();
+                if (!(bool)(bt.GetProperty("IsButton", AnyInstance)?.GetValue(btn) ?? false)) continue;
+                var gen = Convert.ToInt64(bt.GetProperty("Generation", AnyInstance)?.GetValue(btn) ?? 0L, CultureInfo.InvariantCulture);
+                if (gen > currentGeneration) currentGeneration = gen;
+            }
+        }
+        var currentGenStr = currentGeneration.ToString(CultureInfo.InvariantCulture);
 
         var lines = new List<object>();
         var buttons = new List<object>();
         var text = new StringBuilder();
         var omittedInactive = 0;
+        var omittedButtons = 0;
+        var characterBudget = 24000;
+        var textCut = false;
 
         for (var index = start; index < allLines.Count && index < start + limit; index++)
         {
             var line = allLines[index];
-            var lineText = line?.ToString() ?? string.Empty;
-            lines.Add(new Dictionary<string, object>
+            var lineNo = Convert.ToInt32(line?.GetType().GetField("LineNo", AnyInstance)?.GetValue(line) ?? index);
+            var original = line?.ToString() ?? string.Empty;
+            if (characterBudget > 0)
             {
-                ["index"] = index,
-                ["lineNo"] = Convert.ToInt32(line?.GetType().GetField("LineNo", AnyInstance)?.GetValue(line) ?? index),
-                ["text"] = lineText,
-                ["truncated"] = false,
-            });
-            text.Append(lineText).Append("\r\n");
+                var available = Math.Max(0, characterBudget - 2);
+                var clipped = original.Length > available ? original.Substring(0, available) : original;
+                var cut = clipped.Length < original.Length;
+                text.Append(clipped).Append("\r\n");
+                characterBudget -= clipped.Length + 2;
+                textCut |= cut;
+                lines.Add(new Dictionary<string, object>
+                {
+                    ["index"] = index,
+                    ["lineNo"] = lineNo,
+                    ["text"] = clipped,
+                    ["truncated"] = cut,
+                });
+            }
+            else
+            {
+                textCut = true;
+            }
+        }
 
+        // Collect active buttons across all display lines so buttons above the text window are not lost.
+        for (var index = 0; index < allLines.Count; index++)
+        {
+            var line = allLines[index];
+            var lineNo = Convert.ToInt32(line?.GetType().GetField("LineNo", AnyInstance)?.GetValue(line) ?? index);
             var lineButtons = line?.GetType().GetProperty("Buttons", AnyInstance)?.GetValue(line) as Array;
             if (lineButtons is null) continue;
             for (var buttonIndex = 0; buttonIndex < lineButtons.Length; buttonIndex++)
@@ -463,17 +558,22 @@ internal static class Bridge
 
                 var isInteger = (bool)(type.GetProperty("IsInteger", AnyInstance)?.GetValue(button) ?? false);
                 var rawValue = isInteger
-                    ? Convert.ToString(type.GetProperty("Input", AnyInstance)?.GetValue(button), System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty
-                    : Convert.ToString(type.GetProperty("Inputs", AnyInstance)?.GetValue(button), System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
-                var generation = Convert.ToString(type.GetProperty("Generation", AnyInstance)?.GetValue(button), System.Globalization.CultureInfo.InvariantCulture) ?? "0";
-                currentGeneration = Math.Max(currentGeneration, Convert.ToInt32(generation, System.Globalization.CultureInfo.InvariantCulture));
-                var active = needValue && generation == newGeneration.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    ? Convert.ToString(type.GetProperty("Input", AnyInstance)?.GetValue(button), CultureInfo.InvariantCulture) ?? string.Empty
+                    : Convert.ToString(type.GetProperty("Inputs", AnyInstance)?.GetValue(button), CultureInfo.InvariantCulture) ?? string.Empty;
+                var generation = Convert.ToString(type.GetProperty("Generation", AnyInstance)?.GetValue(button), CultureInfo.InvariantCulture) ?? "0";
+                var active = needValue && string.Equals(generation, currentGenStr, StringComparison.Ordinal);
                 if (!active) { omittedInactive++; continue; }
+
+                if (buttons.Count == 128)
+                {
+                    buttons.RemoveAt(0);
+                    omittedButtons++;
+                }
 
                 var label = button.ToString() ?? string.Empty;
                 buttons.Add(new Dictionary<string, object>
                 {
-                    ["id"] = "b-" + index + "-" + buttonIndex + "-" + generation,
+                    ["id"] = "b-" + lineNo + "-" + buttonIndex + "-" + generation,
                     ["label"] = label.Length > 512 ? label.Substring(0, 512) : label,
                     ["labelTruncated"] = label.Length > 512,
                     ["value"] = rawValue.Length > 2048 ? null : rawValue,
@@ -493,7 +593,7 @@ internal static class Bridge
             Json(input),
             text.ToString(),
             string.Join(",", buttons.ConvertAll(x => Json(x))),
-            currentGeneration.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            currentGenStr,
         }));
 
         var result = new Dictionary<string, object>
@@ -513,14 +613,14 @@ internal static class Bridge
             ["buttons"] = buttons,
             ["buttonGeneration"] = currentGeneration,
             ["omittedInactiveButtons"] = omittedInactive,
-            ["omittedButtons"] = 0,
+            ["omittedButtons"] = omittedButtons,
             ["totalLines"] = allLines.Count,
             ["fromLine"] = start,
             ["returnedLines"] = lines.Count,
             ["omittedBefore"] = start,
             ["omittedAfter"] = Math.Max(0, allLines.Count - start - lines.Count),
             ["rawTextLength"] = text.Length,
-            ["textTruncated"] = false,
+            ["textTruncated"] = textCut,
             ["textCharacterBudget"] = 24000,
             ["window"] = _window is null ? null : new Dictionary<string, object>
             {
@@ -529,8 +629,56 @@ internal static class Bridge
                 ["clientHeight"] = _window.ClientSize.Height,
             },
         };
+        if (mode == "visual" || mode == "both" || mode == "auto")
+        {
+            result["screenshot"] = Capture();
+        }
         Remember(result);
+        Record("debug-snapshot", new { btnCount = ((System.Collections.Generic.List<object>)result["buttons"]).Count });
         return result;
+    }
+
+    private static object Capture()
+    {
+        if (_window is null || _window.IsDisposed) throw new InvalidOperationException("Window is not available for screenshot");
+        if (IsIconic(_window.Handle)) throw new InvalidOperationException("Window is minimized; no screenshot claimed");
+        GetWindowRect(_window.Handle, out var r);
+        GetClientRect(_window.Handle, out var c);
+        var origin = new Point();
+        ClientToScreen(_window.Handle, ref origin);
+        var w = r.Right - r.Left;
+        var h = r.Bottom - r.Top;
+        if (w <= 0 || h <= 0 || w > 10000 || h > 10000) throw new InvalidOperationException("Invalid capture dimensions");
+        var name = "screen-" + Interlocked.Increment(ref _imageNumber).ToString("D5", CultureInfo.InvariantCulture) + ".png";
+        var path = Path.Combine(_artifactDir, name);
+        using var bitmap = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+        bool ok;
+        using (var g = Graphics.FromImage(bitmap))
+        {
+            g.Clear(Color.Magenta);
+            var dc = g.GetHdc();
+            try { ok = PrintWindow(_window.Handle, dc, 0); }
+            finally { g.ReleaseHdc(dc); }
+        }
+        if (!ok) throw new InvalidOperationException("PrintWindow failed");
+        var crop = new Rectangle(origin.X - r.Left, origin.Y - r.Top, c.Right - c.Left, c.Bottom - c.Top);
+        if (crop.Width <= 0 || crop.Height <= 0 || crop.X < 0 || crop.Y < 0 || crop.Right > w || crop.Bottom > h)
+        {
+            throw new InvalidOperationException("Invalid client crop");
+        }
+        using (var client = bitmap.Clone(crop, bitmap.PixelFormat))
+        {
+            client.Save(path, ImageFormat.Png);
+        }
+        return new Dictionary<string, object>
+        {
+            ["path"] = path,
+            ["width"] = crop.Width,
+            ["height"] = crop.Height,
+            ["region"] = "game-client",
+            ["method"] = "PrintWindow",
+            ["visualValidity"] = "requires-viewing",
+        };
     }
 
     private static void Remember(Dictionary<string, object> snapshot)
@@ -541,12 +689,22 @@ internal static class Bridge
         {
             if (!Recent.ContainsKey(id)) RecentOrder.Enqueue(id);
             Recent[id] = snapshot;
-            while (RecentOrder.Count > 8) Recent.Remove(RecentOrder.Dequeue());
+            while (RecentOrder.Count > 16) Recent.Remove(RecentOrder.Dequeue());
         }
     }
 
     private static Dictionary<string, object> DescribeInput(object request)
     {
+        var runningTimer = false;
+        try
+        {
+            if (_console != null)
+            {
+                runningTimer = _consoleType.GetProperty("IsRunningTimer", AnyInstance)?.GetValue(_console) is bool rt && rt;
+            }
+        }
+        catch { }
+
         if (request is null)
         {
             return new Dictionary<string, object>
@@ -555,7 +713,8 @@ internal static class Bridge
                 ["requestId"] = "",
                 ["oneInput"] = false,
                 ["needValue"] = false,
-                ["timeLimit"] = 0,
+                ["timeLimit"] = 0L,
+                ["runningTimer"] = runningTimer,
                 ["systemInput"] = false,
             };
         }
@@ -563,18 +722,17 @@ internal static class Bridge
         return new Dictionary<string, object>
         {
             ["kind"] = type.GetField("InputType", AnyInstance)?.GetValue(request)?.ToString() ?? "Void",
-            ["requestId"] = Convert.ToString(type.GetField("ID", AnyInstance)?.GetValue(request), System.Globalization.CultureInfo.InvariantCulture) ?? "",
+            ["requestId"] = Convert.ToString(type.GetField("ID", AnyInstance)?.GetValue(request), CultureInfo.InvariantCulture) ?? "",
             ["oneInput"] = type.GetField("OneInput", AnyInstance)?.GetValue(request) is bool one && one,
             ["needValue"] = type.GetProperty("NeedValue", AnyInstance)?.GetValue(request) is bool need && need,
-            ["timeLimit"] = Convert.ToInt32(type.GetField("Timelimit", AnyInstance)?.GetValue(request) ?? 0),
+            ["timeLimit"] = Convert.ToInt64(type.GetField("Timelimit", AnyInstance)?.GetValue(request) ?? 0L, CultureInfo.InvariantCulture),
+            ["runningTimer"] = runningTimer,
             ["systemInput"] = type.GetField("IsSystemInput", AnyInstance)?.GetValue(request) is bool sys && sys,
         };
     }
 
     // ---- helpers ----
 
-    // The form found during startup can be replaced while the engine builds its UI,
-    // so always resolve the live window and console again before touching the UI.
     private static bool RefreshTargets()
     {
         try
@@ -596,8 +754,6 @@ internal static class Bridge
 
     private static Dictionary<string, object> OnUi(Func<Dictionary<string, object>> operation)
     {
-        // A freshly started engine needs a while before its window and console exist;
-        // wait for the attachment instead of failing the very first observe.
         var wait = System.Diagnostics.Stopwatch.StartNew();
         while (wait.ElapsedMilliseconds < 120000)
         {

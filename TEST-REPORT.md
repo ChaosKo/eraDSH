@@ -351,3 +351,15 @@ bundle patch 从一行扩到两行：除 `dsh-era-bridge` 外，新增一条 `@d
 曾失败并已修正的三处：`BeginInvoke` 排队超时（改由 Idle 刷新缓存）、按最新画面校验导致所有动作被判 `STALE_OBSERVATION`（改为接受最近 8 个已交付观察）、缓存早期窗口句柄（改为每次重新解析）。
 
 注意：`IsHungAppWindow` 在这个引擎上不可靠——不挂钩子直接启动同样被报为“未响应”，因此没有把它当作判据。
+
+### 8.12 三引擎兼容性实测（2026-11-07 22:43–22:52）
+
+| 启动器 | 形态 | 构建 | 观察 | 动作 | 关闭 |
+| --- | --- | --- | --- | --- | --- |
+| `erafl\Emuera.exe` | net8 x64 bundle | 通过 | `WaitInput` 1961 行 / 5 按钮 | 通过 | 通过 |
+| `eratw\…NAudio-x86.exe` | net8 x86 bundle | 通过 | 51 行 / 3 按钮 | 通过 | 通过 |
+| `eratw\…NAudio-x64.exe` | net8 x64 bundle | 通过 | 51 行 / 3 按钮 | 通过 | 通过 |
+| `eratw\Emuera.NET…EEv53 NAudio.exe` | net8 x64 bundle | 通过 | 48 行 / 3 按钮 | 通过 | 通过 |
+| `EraMaou\eramaou_EX 0.92.exe` | .NET Framework x86 | 通过 | 28 行 / 4 按钮 | 通过 | 通过 |
+
+过程中发现一处自身回归：为加入 `engineKind` 修改 `Common.ps1` 时误删了结果对象的 `EngineAssemblyVersion`，.NET Framework 宿主因“会话未声明引擎版本”启动失败、管道超时。补回字段后 Maou 复测通过。真实存档按既有流程移出并还原。

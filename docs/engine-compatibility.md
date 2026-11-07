@@ -141,3 +141,25 @@
 - 按钮 `choose` 路径尚未在该引擎上验证（标题页只用了 EnterKey）。
 - 首次使用需要 .NET SDK 构建适配器（之后复用 DLL）；未打包分发。
 - `Lazyloading` 系列（x86 与多 DLL 变体）未测试。
+
+## 9. 三处引擎实测（2026-11-07 22:43）
+
+同一套「构建 → open → 观察 → 一次动作 → close」流程，全部通过；真实 `Sav`/`emuera.log`/`Dat`/`Debug` 均先移出、后还原。
+
+| 游戏 / 启动器 | 引擎形态 | 结果 | 观察 |
+| --- | --- | --- | --- |
+| `erafl` / `Emuera.exe` | bundle net8 x64 | 通过 | 1961 行、5 个按钮（大量累积缓冲） |
+| `eratw` / `LazyloadingV2.4-Snake-EEv53-NAudio-x86.exe` | bundle net8 **x86** | 通过 | 51 行、3 个按钮 |
+| `eratw` / `LazyloadingV2.4-Snake-EEv53-NAudio-x64.exe` | bundle net8 x64 | 通过 | 51 行、3 个按钮 |
+| `eratw` / `Emuera.NET 1824+v22+EMv18+EEv53 NAudio.exe` | bundle net8 x64 | 通过 | 48 行、3 个按钮 |
+| `EraMaou0.92+EX2.2` / `eramaou_EX 0.92.exe` | .NET Framework x86 1.821 | 通过（回归） | 28 行、4 个按钮 |
+
+结论：
+
+- **x86 与 x64 都能驱动**：启动钩子随引擎进程位数运行，无需两套构建。
+- **多启动器目录必须显式指定** `-EngineExecutable`；eratw 有四个可驱动入口，自动选择会按预期报错并要求挑选。
+- `erafl` 的 1961 行说明长会话下显示缓冲会持续累积，与 [observation-cost.md](observation-cost.md) 记录的结论一致；适配器仍只回尾部窗口，但按钮已改为全量扫描，不会被窗口裁掉。
+
+### 回归中发现并修复的一处自身缺陷
+
+给 `Common.ps1` 增加 `EngineKind` 时误删了结果对象里的 `EngineAssemblyVersion` 字段，导致 .NET Framework 路径构建出的会话缺少版本号，宿主启动即报 `Session settings do not declare engineAssemblyVersion`、管道连接超时。字段已补回，Maou 回归重跑通过。这类“改元数据映射打坏老路径”的问题说明：**新引擎分支每次都要跑一次 Framework 回归**。
