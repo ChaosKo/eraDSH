@@ -60,6 +60,7 @@ internal static class Bridge
     private static DateTime _cachedAt = DateTime.MinValue;
     private static string _failure;
     private static int _imageNumber;
+    private static int _idleTicks;
 
     [DllImport("user32.dll")]
     private static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
@@ -119,6 +120,11 @@ internal static class Bridge
 
     private static void OnIdle(object sender, EventArgs e)
     {
+        _idleTicks++;
+        if (_idleTicks <= 3)
+        {
+            Record("idle-tick", new { tick = _idleTicks, attached = _console != null, forms = Application.OpenForms.Count });
+        }
         if (_console != null)
         {
             try
@@ -134,7 +140,7 @@ internal static class Bridge
         {
             if (RefreshTargets())
             {
-                Record("ready", new { window = _window.GetType().FullName, title = _window.Text, console = _consoleType.FullName });
+                Record("ready", new { window = _window.GetType().FullName, title = _window.Text, console = _consoleType.FullName, tick = _idleTicks });
                 try
                 {
                     _cached = SnapshotCore(new Dictionary<string, object> { ["mode"] = "text", ["limitLines"] = 200 });
@@ -312,6 +318,14 @@ internal static class Bridge
                     Thread.Sleep(100);
                 }
                 var cached = CachedSnapshot();
+                Record("observe-wait", new
+                {
+                    waitedMs = (int)waited.ElapsedMilliseconds,
+                    steady = IsSteadySnapshot(cached),
+                    cacheAgeMs = _cached is null ? -1 : (int)(DateTime.UtcNow - _cachedAt).TotalMilliseconds,
+                    state = cached is null ? null : Convert.ToString(cached["state"]),
+                    lines = cached is null ? 0 : Convert.ToInt32(cached["totalLines"]),
+                });
                 if (!IsSteadySnapshot(cached))
                 {
                     // Never block on a screen that never becomes "steady": answer with what
@@ -1117,7 +1131,11 @@ internal static class Bridge
             }));
         }
         catch { return null; }
-        if (!done.Wait(timeoutMs) || result is null || failure != null) return null;
+        if (!done.Wait(timeoutMs) || result is null || failure != null)
+        {
+            Record("fresh-timeout", new { timeoutMs, executed = done.IsSet, error = failure?.Message });
+            return null;
+        }
         return result;
     }
 

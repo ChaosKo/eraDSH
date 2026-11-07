@@ -460,3 +460,17 @@ bundle patch 从一行扩到两行：除 `dsh-era-bridge` 外，新增一条 `@d
 | `eraTW`（x86） | 8.7 s | 3 | 成功，变为 2 按钮 |
 
 经验：缓存只能当快速路径，判定必须能主动取真值；而在 UI 线程上执行的回调里绝不能再 `BeginInvoke`。
+
+### 8.20 让 open 卡顿可自证（2026-11-08 00:45）
+
+现场证据（`artifacts/bridge-20261107T161133-ca7f2c58/host-audit.jsonl`）：钩子 12 秒后成功生成了一次快照，但那次会话用的是修复前的 DLL，没有 `ready`/`observe-wait` 记录，无法判断卡在哪一步。
+
+新增三条常驻诊断，写进每个会话的 `host-audit.jsonl`：
+
+| 记录 | 内容 |
+| --- | --- |
+| `idle-tick` | 前 3 次 UI 空闲回调（确认 `Application.Idle` 在跑、窗口是否已附加） |
+| `observe-wait` | 每次观察结束时：等待毫秒数、是否就绪、缓存年龄、状态、行数 |
+| `fresh-timeout` | 主动取快照失败时：超时值、回调是否执行、异常信息 |
+
+实测（`eraOCG2`，正常路径）：`open` 12.3 秒，`observe-wait` 记录 `waitedMs=11658, steady=true, cacheAgeMs=52, lines=36`。若下次仍卡住，这三条记录能直接指出是"没等到就绪"还是"UI 线程没执行回调"。
