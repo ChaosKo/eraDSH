@@ -49,8 +49,8 @@ DSH AI / PowerShell 调用者
 | 游戏目录 | `-GameRoot` → `ERADSH_GAME_ROOT` → `erabridge.config.json` 的 `gameRoot` → **当前工作目录** |
 | 引擎 exe | `-EngineExecutable` → `ERADSH_ENGINE_EXE` → 配置的 `engineExecutable` → **在工作目录中自动查找** |
 | 引擎版本 | `-EngineAssemblyVersion` → `ERADSH_ENGINE_VERSION` → 配置项 → 自动读取 |
-| 运行方式 | `-RuntimeMode` → `ERADSH_RUNTIME_MODE` → 配置项 `runtimeMode` → **copy** |
-| 隔离副本 | `-RuntimeDirectory` → `ERADSH_RUNTIME_DIR` → 配置项 → `runtime/instance`（inplace 下为 `runtime/host`） |
+| 运行方式 | `-RuntimeMode` → `ERADSH_RUNTIME_MODE` → 配置项 `runtimeMode` → **inplace** |
+| 运行目录 | `-RuntimeDirectory` → `ERADSH_RUNTIME_DIR` → 配置项 → `runtime/host`（inplace）或 `runtime/instance`（copy） |
 
 游戏目录与插件仓库必须是两个目录；若解析结果等于本仓库，脚本会报错提示。
 
@@ -58,17 +58,18 @@ DSH AI / PowerShell 调用者
 
 | 方式 | 行为 | 游戏目录会被写入吗 |
 | --- | --- | --- |
-| `copy`（默认） | 把游戏目录镜像到 `runtime/<name>/`，引擎从副本加载，`Sav`/`Debug`/`Dat` 在副本里重建为空 | 不会 |
-| `inplace` | **什么都不复制**，引擎直接从游戏目录加载并以它作为工作目录 | 会：`Sav`、`Debug`、`Dat`、`emuera.log`、`emuera.config` 都写在原目录 |
+| `inplace`（默认） | **什么都不复制**，引擎直接从游戏目录加载并以它作为工作目录 | 会：`Sav`、`Debug`、`Dat`、`emuera.log`、`emuera.config` 都写在原目录 |
+| `copy` | 把游戏目录镜像到 `runtime/<name>/`，引擎从副本加载，`Sav`/`Debug`/`Dat` 在副本里重建为空 | 不会 |
 
-`inplace` 是为重资产游戏准备的——含大量图片/音频的 ERA 目录动辄几个 GB，复制一份既慢又占空间。代价是桥接会话会**写真实存档**：
+默认选 `inplace`，是因为含大量图片/音频的 ERA 目录动辄几个 GB，为观察复制一份既慢又占空间。代价是桥接会话会**写真实存档**；需要与存档隔离时显式切到 `copy`：
 
 ```powershell
-.\scripts\Build-Bridge.ps1 -GameRoot 'D:\Games\SomeEraGame' -RuntimeMode inplace
+# 隔离副本（原目录不写入）
+.\scripts\Build-Bridge.ps1 -GameRoot 'D:\Games\SomeEraGame' -RuntimeMode copy
 # 或设置一次环境变量 / 配置文件里的 runtimeMode
 ```
 
-`inplace` 模式下宿主程序仍放在本仓库的 `runtime/host/`，游戏目录里只多出游戏自己写的文件。使用时注意：**不要在人工游玩的同时开原地会话**，两个进程会抢同一份存档；需要与存档隔离的自动化，请继续用 `copy`。
+`inplace` 模式下宿主程序仍放在本仓库的 `runtime/host/`，游戏目录里只多出游戏自己写的文件。使用时注意：**不要在人工游玩的同时开原地会话**，两个进程会抢同一份存档；想拿真实存档做实验前请先自行备份。
 
 ### 引擎自动查找规则
 
@@ -103,8 +104,8 @@ $env:ERADSH_ENGINE_EXE = 'Emuera.exe'
 | `gameRoot` | 游戏目录绝对路径，或相对仓库根的路径；留空则用当前工作目录 |
 | `engineExecutable` | 启动器文件名（相对 `gameRoot`）或绝对路径；留空则自动查找 |
 | `engineAssemblyVersion` | 期望的程序集版本；留空则按实际文件读取并校验 |
-| `runtimeMode` | `copy`（默认，镜像游戏目录）或 `inplace`（原地运行，不复制） |
-| `runtimeDirectory` | 运行目录位置，默认 `runtime/instance`（copy）或 `runtime/host`（inplace） |
+| `runtimeMode` | `inplace`（默认，原地运行不复制）或 `copy`（镜像游戏目录，存档隔离） |
+| `runtimeDirectory` | 运行目录位置，默认 `runtime/host`（inplace）或 `runtime/instance`（copy） |
 
 该文件已被 `.gitignore` 忽略。缺少可用的游戏目录时脚本会直接报错并打印上述顺序，不会猜测路径。
 
@@ -202,13 +203,13 @@ era_bridge({ action: "close",   sessionFile: "<session.json>" })
 ## 隔离与数据
 
 ```text
+runtime/host/         inplace 模式（默认）：只放构建出的宿主程序与来源标记
 runtime/instance/     copy 模式：游戏目录的同内容副本（引擎 SHA-256 校验）、独立配置与 Sav
-runtime/host/         inplace 模式：只放构建出的宿主程序与来源标记
 artifacts/bridge-*/   会话信息、观察、截图、审计、测试结果
 ```
 
+- `inplace` 默认不复制任何内容，引擎在游戏目录里运行，因此 `Sav/Debug/Dat`/日志/配置都写进原目录；这是为含大量素材的游戏准备的代价。
 - `copy` 模式初次构建不复制原存档；`Sav/Debug/Dat` 在副本中重新创建，原目录不会被写入。
-- `inplace` 模式不复制任何内容，引擎在游戏目录里运行，因此 `Sav`/`Debug`/`Dat`/日志/配置都写进原目录；这是为含大量素材的游戏准备的代价。
 - 运行目录被后续构建复用，**不会自动清空其中的存档**；换游戏或想彻底重置请加 `-Recreate`。
 - 两个模式的运行目录里都有 `.erabridge-runtime.json`，记录来源游戏、运行方式与引擎哈希，防止误用别的游戏或别的模式的目录。
 - 每次构建产生新的会话 ID 与凭据；同一份存档不要同时被桥接宿主和手工启动的游戏写入。

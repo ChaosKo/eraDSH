@@ -10,9 +10,9 @@
 #                     file -> auto-detected in gameRoot
 #   engineAssemblyVersion, runtimeDirectory   same ladder, both optional
 #   runtimeMode       explicit parameter -> env ERADSH_RUNTIME_MODE -> configuration
-#                     file -> copy. `copy` mirrors the game folder into the runtime
-#                     directory; `inplace` runs the engine from the game folder and
-#                     copies nothing, so the game writes its own saves there.
+#                     file -> inplace. `inplace` runs the engine from the game folder
+#                     and copies nothing, so the game writes its own saves there;
+#                     `copy` mirrors the folder into the runtime directory instead.
 #
 # The common case therefore needs no configuration at all: open a shell (or a
 # DSH workspace) in the game folder and run the build. A configuration file is
@@ -221,7 +221,7 @@ function Get-EraDshSettings {
  if (Test-EraDshValue $RuntimeMode) { $runtimeModeValue = $RuntimeMode }
  elseif (Test-EraDshValue $env:ERADSH_RUNTIME_MODE) { $runtimeModeValue = $env:ERADSH_RUNTIME_MODE }
  elseif (Test-EraDshValue $file['runtimeMode']) { $runtimeModeValue = $file['runtimeMode'] }
- else { $runtimeModeValue = 'copy' }
+ else { $runtimeModeValue = 'inplace' }
  $runtimeModeValue = $runtimeModeValue.Trim().ToLowerInvariant()
  if ($runtimeModeValue -ne 'copy' -and $runtimeModeValue -ne 'inplace') {
   throw ('runtimeMode must be copy or inplace, not ' + $runtimeModeValue)

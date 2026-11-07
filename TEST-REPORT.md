@@ -280,8 +280,10 @@ bundle patch 从一行扩到两行：除 `dsh-era-bridge` 外，新增一条 `@d
 
 | 方式 | 行为 | 原目录写入 |
 | --- | --- | --- |
-| `copy`（默认） | 镜像到 `runtime/instance`，引擎从副本加载 | 无 |
-| `inplace` | 不复制，引擎从游戏目录加载并以其为工作目录 | `Sav`/`Debug`/`Dat`/日志/配置 |
+| `inplace`（默认） | 不复制，引擎从游戏目录加载并以其为工作目录 | `Sav`/`Debug`/`Dat`/日志/配置 |
+| `copy` | 镜像到 `runtime/instance`，引擎从副本加载 | 无 |
+
+默认值按使用者的决定在验证之后改为 `inplace`；下表的验证先测的 inplace、再测 copy 回归，两者互不影响。
 
 验证在一份临时副本（22.1 MB）上完成，避免触碰真实存档：
 

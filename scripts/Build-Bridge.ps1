@@ -2,13 +2,12 @@
 # No downloads and no package installation; the compiler ships with Windows.
 #
 # Two runtime modes:
-#   copy    - the default. The game folder is mirrored under runtime/<name>/ and the
-#             engine is loaded from there, so saves, logs and configuration written
-#             by a bridge session cannot land in the original game directory.
-#   inplace - nothing is copied. The engine is loaded from the game folder itself and
-#             runs with that folder as its working directory, which is what a game
-#             with heavy assets needs; the game then writes its own Sav/Debug/Dat,
-#             logs and configuration into the original directory.
+#   inplace - the default. Nothing is copied: the engine is loaded from the game
+#             folder itself and runs with that folder as its working directory, which
+#             is what a game with heavy assets needs. The game then writes its own
+#             Sav/Debug/Dat, logs and configuration into the original directory.
+#   copy    - the game folder is mirrored under runtime/<name>/ and the engine is
+#             loaded from there, so a bridge session cannot touch the original saves.
 [CmdletBinding()]
 param(
  [string]$GameRoot,
