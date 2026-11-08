@@ -51,14 +51,19 @@ Emuera 引擎 → 显示缓冲 / 按钮 / 输入请求 / 客户区
 | --- | --- |
 | `observationId` | 会话 ID + 完整缓冲区/输入/按钮的哈希；动作据此做过期校验 |
 | `state` | `Initializing` / `Running` / `WaitInput` / `Error` / `Quit` / `Sleep` |
-| `input` | `kind`、`requestId`、`oneInput`、`needValue`、`timeLimit`、`runningTimer`、`systemInput` |
-| `text` | 本窗口正文（已过滤噪声、折叠装饰线） |
+| `input` | `kind`、`requestId`、`oneInput`、`needValue`、`timeLimit`、`runningTimer`、`systemInput`；`render=compact` 只留 `kind` 与为真的标志 |
+| `text` | 本窗口正文（已过滤噪声、折叠装饰线；`render=compact` 时进一步折叠布局） |
 | `lines` | 逐行数组，默认不下发，`includeLines` 打开 |
-| `buttons` | 全量活动按钮（含代次），超出窗口的行也会收集 |
+| `buttons` | 全量活动按钮（含代次），超出窗口的行也会收集；`render=compact` 只给决策需要的字段 |
 | `cursor` / `nextCursor` / `cursorBase` / `cursorExpired` | 行游标：末尾位置、下一页位置、已丢弃行数、是否失效 |
-| `delta` | 增量结果：`kind`（`append`/`changed`/`none`/`full`）、`fromOrdinal`、`removed`、`lines` |
+| `delta` | 增量结果：`kind`（`append`/`changed`/`none`/`full`）、`fromOrdinal`、`removed`、`lines`；`compact` 下 `act`/`advance` 也会回增量，此时 `text` 为 null |
 | `filteredNoiseLines` / `collapsedSeparators` | 本次过滤掉的加载行与折叠的装饰线数量 |
+| `collapsedLayoutLines` / `mergedRepeatedLines` / `compressedRuns` | `render=compact` 折叠的纯装饰行、合并的重复邻行、压缩的超长字符/空格串数量 |
 | `screenshot` | `visual`/`both`/`auto` 时的客户区 PNG 路径 |
+
+`act` 与 `advance` 在 `compact` 下会拿"你操作的那一屏"（`advance` 取第一次回车之前的那一屏）做增量：累计缓冲的游戏（EraFL 这类不清屏的实现）每步会重发旧屏，因此只回新增/改写行。增量行数达到窗口的 60% 时自动回退成整屏文本，因为逐行 JSON 那时更贵；`delta.reason` 会写明回退原因。
+
+`render` 只改变呈现：`compact`（工具层默认）把纯装饰行换成 `▦(宽度)`、把连续相同行折成 `行 ×N`、把长串同字符压成 `字符×N`，并省掉诊断字段；`full` 原样返回。两者共用同一个 `observationId`，动作授权不受影响。按钮的 `generation`/`value` 只在响应里被裁剪，投递与校验仍用完整按钮，因此不能在响应体之外依赖这些字段。
 
 `observationId` 覆盖完整缓冲区，与分页、过滤、增量参数无关——这些只改变呈现，不改变"这是哪一屏"。
 

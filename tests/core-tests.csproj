@@ -13,4 +13,7 @@
     <Compile Include="core-tests.cs" />
     <Compile Include="../bridge/net8/EraBridgeHook/StartupHook.cs" Link="StartupHook.cs" />
   </ItemGroup>
+  <ItemGroup>
+    <Content Include="fixtures/ocg-duel-screen.txt" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 </Project>

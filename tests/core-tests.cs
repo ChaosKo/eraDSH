@@ -315,6 +315,111 @@ namespace CoreTests
             var status = JsonDocument.Parse((string)Call("Dispatch", Request(new { action = "status" }))).RootElement;
             Check("status-is-cheap-and-does-not-authorize-cache", !status.GetProperty("canAct").GetBoolean() && status.GetProperty("pending").GetBoolean() && status.GetProperty("requiresObservation").GetBoolean());
             Check("all-late-callbacks-safe", UiExceptions == 0);
+
+            // Compact view is a presentation projection of a real duel screen captured
+            // from eraOCG2: it must shrink the text, keep what a decision reads, and
+            // leave observation identity and button authorization untouched.
+            Reset();
+            var fixture = File.ReadAllLines(Path.Combine(AppContext.BaseDirectory, "fixtures", "ocg-duel-screen.txt"));
+            Ui(() =>
+            {
+                Model.DisplayLineList.Clear();
+                for (var i = 0; i < fixture.Length; i++)
+                    Model.DisplayLineList.Add(new CoreFake.Forms.Line { LineNo = 100 + i, Text = fixture[i] });
+            });
+            var fullScreen = Snap(new() { ["mode"] = "text", ["limitLines"] = 200 });
+            var compactScreen = Snap(new() { ["mode"] = "text", ["limitLines"] = 200, ["render"] = "compact" });
+            var fullText = Convert.ToString(fullScreen["text"]);
+            var compactText = Convert.ToString(compactScreen["text"]);
+            Check("compact-keeps-observation-identity", S(fullScreen, "observationId") == S(compactScreen, "observationId") && S(fullScreen, "inputEpoch") == S(compactScreen, "inputEpoch"));
+            Check("compact-shrinks-a-real-duel-screen", compactText.Length < fullText.Length * 0.6 && Convert.ToInt32(compactScreen["collapsedLayoutLines"]) >= 20);
+            Check("compact-preserves-card-names-and-scores", compactText.Contains("特莱恩") && compactText.Contains("玩家基本分") && compactText.Contains("虫惑之园") && compactText.Contains("MAGIC / TRAPS"));
+            Check("compact-folds-repeated-neighbours", compactText.Contains(" ×") && Convert.ToInt32(compactScreen["mergedRepeatedLines"]) > 0);
+            Check("full-view-keeps-diagnostics", fullScreen.ContainsKey("window") && fullScreen.ContainsKey("consistency") && fullScreen.ContainsKey("buttonGeneration"));
+
+            Reset();
+            Ui(() => { Model.DisplayLineList.Clear(); Model.DisplayLineList.Add(new CoreFake.Forms.Line { LineNo = 30, Text = "┌──────────────┐ 攻击", Buttons = new[] { new CoreFake.Forms.Button { Input = 7, Label = "攻击" } } }); });
+            var compactChoice = JsonDocument.Parse((string)Call("Dispatch", Request(new { action = "observe", mode = "text", limitLines = 80, render = "compact", timeoutMs = 500 }))).RootElement;
+            var slimButton = compactChoice.GetProperty("buttons")[0];
+            Check("compact-buttons-drop-diagnostics", slimButton.TryGetProperty("id", out _) && slimButton.TryGetProperty("label", out _) && slimButton.TryGetProperty("integer", out _) && !slimButton.TryGetProperty("generation", out _) && !slimButton.TryGetProperty("lineIndex", out _) && !slimButton.TryGetProperty("valueTooLong", out _));
+            Check("compact-response-drops-metadata", !compactChoice.TryGetProperty("window", out _) && !compactChoice.TryGetProperty("consistency", out _) && !compactChoice.TryGetProperty("projectionId", out _) && compactChoice.TryGetProperty("observationId", out _) && compactChoice.TryGetProperty("input", out _));
+            Check("compact-button-still-authorizes", Act(compactChoice.GetProperty("observationId").GetString(), "choose", choiceId: slimButton.GetProperty("id").GetString()).GetProperty("submitted").GetBoolean() && Model.PressCount == 1);
+
+            // The envelope matters as much as the text: a full 25-button menu carries
+            // generation, value and line index per button plus every diagnostic field.
+            Reset();
+            Ui(() =>
+            {
+                Model.DisplayLineList.Clear();
+                Model.DisplayLineList.Add(new CoreFake.Forms.Line
+                {
+                    LineNo = 40,
+                    Text = "menu",
+                    Buttons = Enumerable.Range(0, 25).Select(i => new CoreFake.Forms.Button { Input = 500 + i, Label = "choice " + i }).ToArray(),
+                });
+            });
+            var fullEnvelope = (string)Call("Dispatch", Request(new { action = "observe", mode = "text", limitLines = 80, render = "full", timeoutMs = 500 }));
+            var compactEnvelope = (string)Call("Dispatch", Request(new { action = "observe", mode = "text", limitLines = 80, render = "compact", timeoutMs = 500 }));
+            Check("compact-envelope-shrinks", compactEnvelope.Length < fullEnvelope.Length * 0.6);
+
+            // EraFL shapes: a long blank run stays blank, layout tags keep only identity,
+            // and a button label loses its padding.
+            Reset();
+            Ui(() =>
+            {
+                Model.DisplayLineList.Clear();
+                Model.DisplayLineList.Add(new CoreFake.Forms.Line { LineNo = 50, Text = "<img src='FACE_4' height='200px' width='200px'><div xpos='768' width='200px' height='200px'>" });
+                for (var i = 0; i < 6; i++) Model.DisplayLineList.Add(new CoreFake.Forms.Line { LineNo = 51 + i, Text = "                    " });
+                Model.DisplayLineList.Add(new CoreFake.Forms.Line { LineNo = 60, Text = "  [      帮助]", Buttons = new[] { new CoreFake.Forms.Button { Input = 59, Label = "  [      帮助]" } } });
+            });
+            var eraflView = JsonDocument.Parse((string)Call("Dispatch", Request(new { action = "observe", mode = "text", limitLines = 80, render = "compact", timeoutMs = 500 }))).RootElement;
+            var eraflText = eraflView.GetProperty("text").GetString();
+            Check("compact-tags-keep-identity-only", eraflText.Contains("⟨img FACE_4⟩") && eraflText.Contains("⟨div⟩") && !eraflText.Contains("height=") && !eraflText.Contains("</div>"));
+            Check("compact-blank-runs-stay-blank", !eraflText.Contains(" ×6") && Convert.ToInt32(eraflView.GetProperty("mergedRepeatedLines").GetInt32()) >= 5);
+            Check("compact-labels-drop-padding", eraflView.GetProperty("buttons")[0].GetProperty("label").GetString() == " [ 帮助]");
+
+            // A cumulative buffer must not re-send the whole window after an action: the
+            // reply delta-carries only what changed, since the caller already holds it.
+            Reset();
+            var before = JsonDocument.Parse((string)Call("Dispatch", Request(new { action = "observe", mode = "text", limitLines = 80, render = "compact", timeoutMs = 500 }))).RootElement;
+            Ui(() => Model.DisplayLineList.Add(new CoreFake.Forms.Line { LineNo = 90, Text = "appended narration line" }));
+            var after = JsonDocument.Parse((string)Call("Dispatch", Request(new
+            {
+                action = "act",
+                observationId = before.GetProperty("observationId").GetString(),
+                kind = "input",
+                value = "1",
+                actionId = Guid.NewGuid().ToString(),
+                mode = "text",
+                render = "compact",
+                timeoutMs = 500,
+            }))).RootElement.GetProperty("observation");
+            var deltaKind = after.GetProperty("delta").GetProperty("kind").GetString();
+            var firstAppended = after.GetProperty("delta").GetProperty("lines")[0].GetProperty("text").GetString();
+            var textReplacedByDelta = !after.TryGetProperty("text", out var repliedText) || repliedText.ValueKind == JsonValueKind.Null;
+            Check("act-replies-with-a-delta-not-the-whole-window", deltaKind == "append" && firstAppended == "appended narration line" && textReplacedByDelta);
+
+            // A long Enter run must not re-send the window it started from either.
+            Reset("EnterKey", 0);
+            Ui(() =>
+            {
+                for (var i = 0; i < 20; i++) Model.DisplayLineList.Add(new CoreFake.Forms.Line { LineNo = 200 + i, Text = "body " + i });
+                Model.OnPress = () =>
+                {
+                    Model.DisplayLineList.Add(new CoreFake.Forms.Line { LineNo = 300 + Model.PressCount, Text = "step " + Model.PressCount });
+                    // A real engine answers an Enter with a new input request; without
+                    // that rotation Advance correctly reports "stalled" instead.
+                    ((CoreFake.Forms.InputRequest)Model.inputReq).ID++;
+                };
+            });
+            var advanceRun = JsonDocument.Parse((string)Call("Dispatch", Request(new { action = "advance", maxSteps = 3, timeoutMs = 2000, mode = "text", render = "compact" }))).RootElement;
+            var advanceView = advanceRun.GetProperty("observation");
+            var advanceDelta = advanceView.GetProperty("delta");
+            Check("advance-replies-with-a-delta-not-the-whole-window",
+                advanceRun.GetProperty("steps").GetInt32() == 3 &&
+                advanceDelta.GetProperty("kind").GetString() == "append" &&
+                advanceDelta.GetProperty("lines").GetArrayLength() == 3 &&
+                advanceView.GetProperty("text").ValueKind == JsonValueKind.Null);
         }
     }
 }

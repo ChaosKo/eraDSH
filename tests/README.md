@@ -34,3 +34,15 @@ entry point, so it must run under 32-bit PowerShell:
 
 Every script writes its results into the session artifact directory; nothing
 touches the original game folder.
+
+## Synthetic suites (no game, no real engine)
+
+| Suite | Run | Scope |
+| --- | --- | --- |
+| Core (`.NET 8` hook) | `dotnet run --project tests/core-tests.csproj -c Release` | input epochs, stale/duplicate actions, deadlines, bounded UI work, delta budget, compact rendering |
+| Framework (`net48` host) | `tests\framework-regression.ps1` | the same authorization chain for the reflection adapter, plus compact rendering parity |
+
+The compact-rendering checks read `fixtures/ocg-duel-screen.txt`, a real eraOCG2
+duel screen captured from a session log. It is the fixture behind the measured
+55.8% text reduction in [observation-cost.md](../docs/observation-cost.md#10-表现层压缩rendercompact2026-11-09);
+if the rendering rules change, update both the numbers and the assertions.

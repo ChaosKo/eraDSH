@@ -16,6 +16,7 @@ param(
  [long]$SinceCursor = -1,
  [int]$MaxSteps = 20,
  [ValidateSet('filter','raw')][string]$Noise='filter',
+ [ValidateSet('full','compact')][string]$Render='full',
  [string]$OutputPath
 )
 $ErrorActionPreference='Stop'
@@ -78,6 +79,7 @@ if($SinceObservationId) { $request.sinceObservationId=$SinceObservationId }
 if($SinceCursor -ge 0) { $request.sinceCursor=$SinceCursor }
 if($Action -eq 'advance') { $request.maxSteps=$MaxSteps }
 if($Noise -ne 'filter') { $request.noise=$Noise }
+if($Render -ne 'full') { $request.render=$Render }
 # One bounded host budget; the client transport has a small additional allowance.
 $request.timeoutMs=if($Action -in @('act','advance')){15000}else{10000}
 if($FromLine -ge 0) { $request.fromLine=$FromLine }

@@ -11,7 +11,10 @@
 - insert:
     - id: dsh-era-bridge
       name: dsh-era-bridge
-      config: {}
+      config:
+        # Compact rendering is the default: the same screen is re-sent on every
+        # step, so layout-only lines and diagnostic fields are pure cost.
+        render: compact
 
     # Keep `config.id` stable: sessions store it. `order` places the preset
     # after the shipped ones (standard 1, ptc 2, minimal 3, cordis 4).
@@ -49,6 +52,15 @@
                 - 分清拒绝码：NOT_READY/NOT_WAITING_INPUT 当前不可输入、STALE_OBSERVATION 输入代次已变、DUPLICATE_ACTION 已记录该动作、WRONG_INPUT_KIND 输入类型不符、INVALID_INPUT 值不合法。
                 - 正文来自引擎缓冲，可能夹带 img、shape 一类标签；截图是本机 PNG 路径，要看画面必须另外用图像工具打开，不能因为 observe 成功就说画面没问题。
                 - fromLine 与 limitLines 只是分页读取，不改变游戏状态。
+
+                # 省上下文
+
+                一屏正文每步都会重新下发，所以读得省和玩得对同样重要：
+                - 观察默认是 compact：`▦(宽度)` 是纯装饰行（边框、空卡片槽），`行 ×N` 是连续重复行，`字符×N` 是超长连续字符或空格，`⟨img FACE_4⟩`／`⟨div⟩` 是布局标签（只留来源与种类）。它们只表示"这里只有布局"，不要据此补猜内容；确实需要原文（对齐坐标、核对 ASCII 表）时再传 `render: "full"`。
+                - act 与 advance 之后 `text` 可能是 null 而 `delta.kind=append`：只给了新增行，旧屏你已经看过。`delta.kind=none` 说明这一屏没变；`delta.kind=full` 才是整屏重发（新内容占了大半窗口）。
+                - 动作之后先用 `sinceObservationId` 取增量，`delta.kind` 为 `none` 就说明这一屏没变，不必重读；`append`/`changed` 只给新增行。
+                - 不要在回复里复述整屏正文或大段牌表；摘要状态（日期、金钱、LP、手卡数、下一步）写进 todo_write。
+                - 一局十步以上时，把当前目标与已知资源写成短清单，靠清单而不是对话历史恢复状态。
 
                 # Era 游戏基础
 
@@ -120,6 +132,10 @@
               - id: tool-result-pruner
                 name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
                 config:
-                  thresholdChars: 8192
-                  headChars: 4096
-                  tailChars: 1024
+                  # Era observations are bounded by the engine window, so an
+                  # oversized result means a full-screen legacy shape or a
+                  # screenshot list. Keep enough of the tail to preserve the
+                  # newest narration lines the next decision depends on.
+                  thresholdChars: 6144
+                  headChars: 3072
+                  tailChars: 2048

@@ -137,6 +137,32 @@ public static class FrameworkRegression {
   c=Fresh();c.state="Initializing";clock=Stopwatch.StartNew();advance=OnPumpedThread(delegate{return Dict(Invoke("Advance",Map("timeoutMs",100,"maxSteps",200)));});
   Check("advance_budget_not_multiplied_by_max_steps",clock.ElapsedMilliseconds<1500&&c.Submissions==0);
 
+  c=Fresh();c.displayLineList.Add(new FrameworkFixture.Line(900,"┌──────────────┐"));c.displayLineList.Add(new FrameworkFixture.Line(901,"│ [1] menu     │",new FrameworkFixture.Button(1,7)));c.displayLineList.Add(new FrameworkFixture.Line(902,"└──────────────┘"));c.displayLineList.Add(new FrameworkFixture.Line(903,"└──────────────┘"));
+  var fullView=OnPumpedThread(delegate{return Dict(Invoke("Dispatch",Map("action","observe","mode","text","limitLines",80,"render","full","timeoutMs",500)));});
+  var compactView=OnPumpedThread(delegate{return Dict(Invoke("Dispatch",Map("action","observe","mode","text","limitLines",80,"render","compact","timeoutMs",500)));});
+  Check("compact_view_shrinks_and_keeps_identity",Str(compactView,"observationId")==Str(fullView,"observationId")&&Str(compactView,"text").Length<Str(fullView,"text").Length&&Str(compactView,"text").Contains("▦(")&&!compactView.ContainsKey("displayHash")&&!compactView.ContainsKey("window"));
+  Check("compact_view_buttons_keep_authority",Yes(Act(compactView,"choose","",FirstChoice(compactView)),"submitted")&&c.Submissions==1);
+
+  c=Fresh();var held=OnPumpedThread(delegate{return Dict(Invoke("Dispatch",Map("action","observe","mode","text","limitLines",80,"render","compact","timeoutMs",500)));});
+  c.displayLineList.Add(new FrameworkFixture.Line(910,"appended narration line"));
+  var acted=OnPumpedThread(delegate{return Dict(Invoke("Dispatch",Map("action","act","observationId",Str(held,"observationId"),"kind","input","value","7","actionId",Guid.NewGuid().ToString(),"mode","text","render","compact","timeoutMs",500)));});
+  var actedView=Dict(acted["observation"]);var actedDelta=Dict(actedView["delta"]);
+  Check("act_replies_with_a_delta_not_the_whole_window",Str(actedDelta,"kind")=="append"&&actedView.ContainsKey("text")&&actedView["text"]==null);
+
+  var run=Fresh("EnterKey");
+  // Fresh() seeds a menu line with a button; narration needs a screen that only waits.
+  run.displayLineList.Clear();
+  for(int n=1;n<20;n++)run.displayLineList.Add(new FrameworkFixture.Line(200+n,"body "+n));
+  run.AfterSubmit=delegate(FrameworkFixture.Console k){
+   k.displayLineList.Add(new FrameworkFixture.Line(300+k.Submissions,"step "+k.Submissions));
+   // A real engine answers an Enter with a new input request; without that rotation
+   // Advance correctly stops as "pending" after the first press.
+   ((FrameworkFixture.Request)k.inputReq).ID++;};
+
+  var runResult=OnPumpedThread(delegate{return Dict(Invoke("Advance",Map("maxSteps",3,"timeoutMs",2000,"mode","text","render","compact")));});
+  var runView=Dict(runResult["observation"]);var runDelta=Dict(runView["delta"]);
+  Check("advance_replies_with_a_delta_not_the_whole_window",Convert.ToInt32(runResult["steps"])==3&&Str(runDelta,"kind")=="append"&&runView.ContainsKey("text")&&runView["text"]==null);
+
  }
  [STAThread] public static int Main(string[] args) {
   try {

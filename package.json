@@ -1,6 +1,6 @@
 {
   "name": "dsh-era-bridge",
-  "version": "0.3.1",
+  "version": "0.4.1",
   "private": true,
   "description": "DeepSeek Harness plugin that reads and controls a managed Emuera/Era game instance through a local bridge.",
   "keywords": ["dsh", "dsh-plugin", "emuera", "era", "game-bridge"],
@@ -25,6 +25,7 @@
     "tests/*.mjs",
     "tests/*.cs",
     "tests/*.csproj",
+    "tests/fixtures/*.txt",
     "erabridge.config.example.json",
     "README.md",
     "TEST-REPORT.md",

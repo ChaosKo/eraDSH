@@ -102,11 +102,14 @@ export function apply(ctx, config = {}) {
   const powershell = isAbsolute(config.powershellPath ?? '') ? config.powershellPath : defaultPowerShell
   const configuredSession = typeof config.sessionFile === 'string' && config.sessionFile.length > 0 ? config.sessionFile : undefined
   const defaultRuntimeMode = RUNTIME_MODES.includes(config.runtimeMode) ? config.runtimeMode : 'inplace'
+  // Compact rendering is the default because the same screen is re-sent on every
+  // step; the full projection stays one argument away for evidence and debugging.
+  const defaultRender = config.render === 'full' ? 'full' : 'compact'
 
   ctx.effect(() => ctx.tools.register({
     name: 'era_bridge',
     description:
-      'Build a session and read or control a managed Era game. Start with build and the game folder; later calls remember that session. Open returns a launch receipt, not a ready screen. Observe until canAct=true before submitting input; pending=true means the engine is still busy. Act uses an observationId tied to the current input request, so decorative redraws do not invalidate it but a new input request does. Text comes from the engine display buffer; screenshot files must be viewed separately.',
+      'Build a session and read or control a managed Era game. Start with build and the game folder; later calls remember that session. Open returns a launch receipt, not a ready screen. Observe until canAct=true before submitting input; pending=true means the engine is still busy. Act uses an observationId tied to the current input request, so decorative redraws do not invalidate it but a new input request does. Text comes from the engine display buffer; screenshot files must be viewed separately. Observations render compact by default: layout-only lines become ▦(width) markers, repeats fold into "line ×N", layout tags keep only their source, and diagnostic fields are omitted. In compact mode an act reply carries only the lines the action added (text=null with delta), unless the change covers most of the window.',
     parameters: {
       type: 'object',
       properties: {
@@ -122,6 +125,7 @@ export function apply(ctx, config = {}) {
         sinceCursor: { type: 'integer', description: 'Continue from a line cursor: pass nextCursor from the previous page to read the next block of lines, or cursor to follow the tail. cursorExpired is true when the engine already dropped those rows; the reply then carries the current window instead.' },
         sinceObservationId: { type: 'string', description: 'Incremental observe: pass a prior observation id to receive delta.kind=append/changed/none, or full when the base is unavailable or too large. Display revision is independent of pagination; inputEpoch separately identifies the live input request.' },
         noise: { type: 'string', enum: ['filter', 'raw'], description: 'filter (default) drops engine loading chatter (読み込み/ロード/Loading lines, bare .erb/.erh/.csv listings) and collapses long separator runs, reporting counts in filteredNoiseLines and collapsedSeparators; raw returns the display buffer verbatim.' },
+        render: { type: 'string', enum: ['compact', 'full'], description: 'compact (default) rewrites only the readable projection: a decoration-only line becomes "▦(<width>)", a long run of one decoration character becomes "<char>×N", identical neighbours fold into "<line> ×N", and diagnostic fields are dropped. full returns every engine line verbatim with the full response shape. Neither changes observationId, button ids, or engine line numbers.' },
         limitLines: { type: 'integer', minimum: 1, maximum: 200, description: 'Maximum display-buffer lines to return.' },
         fromLine: { type: 'integer', minimum: 0, description: 'Zero-based display-buffer line to start from; omit for the newest page.' },
         observationId: { type: 'string', description: 'Observation id the action is based on. Required for act.' },
@@ -180,6 +184,7 @@ export function apply(ctx, config = {}) {
       if (args.sinceCursor != null) cli.push('-SinceCursor', String(args.sinceCursor))
       if (action === 'advance' && args.maxSteps != null) cli.push('-MaxSteps', String(args.maxSteps))
       if (args.noise) cli.push('-Noise', String(args.noise))
+      cli.push('-Render', args.render === 'full' ? 'full' : defaultRender)
       const actionId = action === 'act' ? String(args.actionId || randomUUID()) : undefined
       if (action === 'act') {
         if (!args.observationId) throw new Error('act requires observationId from the latest observation')

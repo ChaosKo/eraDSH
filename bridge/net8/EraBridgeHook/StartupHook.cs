@@ -375,7 +375,7 @@ internal static class Bridge
             case "close":
                 return Json(new Dictionary<string, object> { ["ok"] = true, ["status"] = "normal_close_scheduled" });
             case "observe":
-                return Json(Observe(request));
+                return Respond(request, Observe(request));
             case "act":
                 return Act(request);
             case "advance":
@@ -397,12 +397,17 @@ internal static class Bridge
         var stopped = "deadline";
         Dictionary<string, object> snapshot = null;
         string submittedEpoch = null;
+        // The screen the caller is looking at when it asks for narration. The final
+        // projection is expressed relative to it, so a long Enter run does not re-send
+        // the whole window it started from.
+        string initialId = null;
         var progress = System.Diagnostics.Stopwatch.StartNew();
         while (!deadline.Expired)
         {
             var step = OnUi(() =>
             {
                 var current = SnapshotCore(sampleOptions);
+                if (initialId is null) initialId = Convert.ToString(current["observationId"]);
                 var waitingForEngine = Convert.ToString(current["state"]) is "Running" or "Initializing" or "Sleep";
                 if (submittedEpoch != null && (Convert.ToString(current["inputEpoch"]) == submittedEpoch ||
                     (!Flag(current, "canAct") && waitingForEngine)))
@@ -451,12 +456,16 @@ internal static class Bridge
             // another long wait after all the steps have consumed the budget.
             if (!deadline.Expired)
             {
-                var final = OnUi(() => { var x = SnapshotCore(sampleOptions); AddVisual(x, options); return x; }, deadline, Math.Min(300, deadline.Remaining));
+                var finalOptions = new Dictionary<string, object>(sampleOptions);
+                if (finalOptions.ContainsKey("compact") && Convert.ToBoolean(finalOptions["compact"], CultureInfo.InvariantCulture) &&
+                    !string.IsNullOrEmpty(initialId))
+                    finalOptions["since"] = initialId;
+                var final = OnUi(() => { var x = SnapshotCore(finalOptions); AddVisual(x, options); return x; }, deadline, Math.Min(300, deadline.Remaining));
                 if (Flag(final, "ok")) snapshot = final;
             }
             Deliver(snapshot);
         }
-        return Json(new Dictionary<string, object> { ["ok"] = true, ["steps"] = Volatile.Read(ref steps), ["stoppedBecause"] = stopped, ["observation"] = snapshot });
+        return Respond(request, new Dictionary<string, object> { ["ok"] = true, ["steps"] = Volatile.Read(ref steps), ["stoppedBecause"] = stopped, ["observation"] = snapshot });
     }
 
     private static string Act(JsonElement request)
@@ -513,7 +522,7 @@ internal static class Bridge
         }
         if (result.TryGetValue("observation", out var returned) && returned is Dictionary<string, object> observation) Deliver(observation);
         if (result.TryGetValue("current", out var currentValue) && currentValue is Dictionary<string, object> current) Deliver(current);
-        return Json(result);
+        return Respond(request, result);
     }
 
     private static Dictionary<string, object> ActCore(JsonElement request, string actionId, Dictionary<string, object> options, Deadline deadline)
@@ -576,6 +585,13 @@ internal static class Bridge
         try
         {
             var afterOptions = new Dictionary<string, object>(options) { ["mode"] = "text" };
+            // A cumulative display buffer re-sends old screens on every step. The caller
+            // already holds the screen it acted on, so the reply carries only what the
+            // action added or rewrote; an unknown base falls back to the full text.
+            if (options.ContainsKey("compact") && Convert.ToBoolean(options["compact"], CultureInfo.InvariantCulture))
+            {
+                afterOptions["since"] = claimed;
+            }
             var after = SnapshotCore(afterOptions);
             if (!deadline.Expired) AddVisual(after, options);
             Cache(after);
@@ -612,6 +628,15 @@ internal static class Bridge
             t.StartsWith("Loading", StringComparison.OrdinalIgnoreCase);
         if (startsWithProgress) return true;
 
+        // EraFL and other large scripts print their compile summary as plain prose.
+        var compileSummary =
+            t.StartsWith("正在构造用户定义函数列表", StringComparison.Ordinal) ||
+            t.StartsWith("正在验证脚本语法", StringComparison.Ordinal) ||
+            t.StartsWith("非注释行数", StringComparison.Ordinal) ||
+            (t.StartsWith("正在", StringComparison.Ordinal) &&
+             (t.Contains("関数") || t.Contains("函数") || t.Contains("構文") || t.Contains("语法") || t.Contains("読み込") || t.Contains("读取")));
+        if (compileSummary) return true;
+
         var lower = t.ToLowerInvariant();
         var hasFileExtension = lower.Contains(".erb") || lower.Contains(".erh") || lower.Contains(".csv");
         if (!hasFileExtension) return false;
@@ -636,6 +661,240 @@ internal static class Bridge
         return first + " ×" + t.Length.ToString(CultureInfo.InvariantCulture);
     }
 
+    // ---- presentation compaction (render=compact) ----
+    //
+    // An Era screen is mostly layout: rules, frames, empty card slots. Those bytes are
+    // re-sent on every observation and carry almost no decision content. Compact view
+    // rewrites only what the caller reads:
+    //   * a decoration-only line becomes "▦(<width>)", so the layout scale survives;
+    //   * a long run of one decoration character becomes "<char>×N";
+    //   * identical neighbours fold into "<line> ×N".
+    // Observation identity, button ids and engine line numbers are untouched: the
+    // projection is presentation, and noise=raw / render=full still return everything.
+    private const string DecorationChars =
+        " \u00A0\u3000─━│┃┌┐└┘├┤┬┴┼╭╮╯╰═║╔╗╚╝╠╣╦╩╬-‐‑‒–—―_=＝＿~～·・‥…．.／/＼\\｜|△▽▲▼◆◇○●◎☆★※＊*";
+
+    private static bool IsDecorationChar(char c) => char.IsWhiteSpace(c) || DecorationChars.IndexOf(c) >= 0;
+
+    private static bool IsDecorationLine(string text)
+    {
+        for (var i = 0; i < text.Length; i++) if (!IsDecorationChar(text[i])) return false;
+        return true;
+    }
+
+    private static string CompressRuns(string text, out bool compressed)
+    {
+        compressed = false;
+        if (string.IsNullOrEmpty(text) || text.Length < 8) return text;
+        var builder = new StringBuilder(text.Length);
+        var index = 0;
+        while (index < text.Length)
+        {
+            var c = text[index];
+            var end = index + 1;
+            while (end < text.Length && text[end] == c) end++;
+            var length = end - index;
+            if (length >= 8 && IsDecorationChar(c))
+            {
+                builder.Append(c).Append('×').Append(length.ToString(CultureInfo.InvariantCulture));
+                compressed = true;
+            }
+            else builder.Append(text, index, length);
+            index = end;
+        }
+        return builder.ToString();
+    }
+
+    // Rewrites the delivered line page into its compact projection. Returns the lines
+    // the caller reads plus their engine indices, so a cursor still points at the same
+    // absolute row; counters are reported, never silent.
+    private static void CompactDisplay(
+        List<string> source,
+        List<int> sourceIndex,
+        out List<string> target,
+        out List<int> targetIndex,
+        out int decorationLines,
+        out int mergedLines,
+        out int compressedRuns)
+    {
+        decorationLines = 0;
+        mergedLines = 0;
+        compressedRuns = 0;
+        var rendered = new List<string>(source.Count);
+        foreach (var line in source)
+        {
+            if (line.Trim().Length == 0) rendered.Add(string.Empty);
+            else if (IsDecorationLine(line))
+            {
+                rendered.Add("▦(" + line.TrimEnd().Length.ToString(CultureInfo.InvariantCulture) + ")");
+                decorationLines++;
+            }
+            else
+            {
+                var text = CompressRuns(CompactTags(line), out var compressed);
+                if (compressed) compressedRuns++;
+                rendered.Add(text);
+            }
+        }
+        target = new List<string>(rendered.Count);
+        targetIndex = new List<int>(rendered.Count);
+        var position = 0;
+        while (position < rendered.Count)
+        {
+            var line = rendered[position];
+            var run = position + 1;
+            while (run < rendered.Count && string.Equals(rendered[run], line, StringComparison.Ordinal)) run++;
+            var count = run - position;
+            targetIndex.Add(sourceIndex[position]);
+            mergedLines += count - 1;
+            // A folded run of blank lines stays blank: " ×37" is a marker for content
+            // that does not exist, and the count is already reported by mergedRepeatedLines.
+            if (line.Length == 0) target.Add(string.Empty);
+            else target.Add(count > 1 ? line + " ×" + count.ToString(CultureInfo.InvariantCulture) : line);
+            position = run;
+        }
+    }
+
+    // Era layout tags describe geometry, not content: "height='600px' width='640px'"
+    // is re-sent on every screen and never changes a decision. Keep the identity of a
+    // picture, drop the placement, and drop closing tags outright.
+    private static readonly string[] LayoutTags = { "img", "div", "span", "shape", "font", "br", "p", "b", "i", "ruby", "rt", "table", "tr", "td" };
+
+    private static string CompactTags(string text)
+    {
+        if (text.IndexOf('<') < 0) return text;
+        var builder = new StringBuilder(text.Length);
+        var index = 0;
+        while (index < text.Length)
+        {
+            var open = text.IndexOf('<', index);
+            if (open < 0) { builder.Append(text, index, text.Length - index); break; }
+            builder.Append(text, index, open - index);
+            var close = text.IndexOf('>', open + 1);
+            if (close < 0 || close - open > 200) { builder.Append(text, open, text.Length - open); break; }
+            var tag = text.Substring(open + 1, close - open - 1).Trim();
+            builder.Append(CompactTag(tag, out var known));
+            if (!known) { builder.Append(text, open, close - open + 1); }
+            index = close + 1;
+        }
+        return builder.ToString();
+    }
+
+    private static string CompactTag(string tag, out bool known)
+    {
+        known = false;
+        if (tag.Length == 0) return string.Empty;
+        var closing = tag[0] == '/';
+        var body = closing ? tag.Substring(1).Trim() : tag;
+        var space = body.IndexOfAny(new[] { ' ', '\t' });
+        var name = (space < 0 ? body : body.Substring(0, space)).Trim().ToLowerInvariant();
+        if (name.Length == 0 || Array.IndexOf(LayoutTags, name) < 0) return string.Empty;
+        known = true;
+        if (closing) return string.Empty;
+        if (name == "img")
+        {
+            var src = TagAttribute(body, "src");
+            return src.Length > 0 ? "⟨img " + src + "⟩" : "⟨img⟩";
+        }
+        return "⟨" + name + "⟩";
+    }
+
+    private static string TagAttribute(string tag, string attribute)
+    {
+        var key = attribute + "=";
+        var at = tag.IndexOf(key, StringComparison.OrdinalIgnoreCase);
+        if (at < 0) return string.Empty;
+        var value = at + key.Length;
+        if (value >= tag.Length) return string.Empty;
+        var quote = tag[value];
+        if (quote == '\'' || quote == '"')
+        {
+            var end = tag.IndexOf(quote, value + 1);
+            return end < 0 ? string.Empty : tag.Substring(value + 1, end - value - 1);
+        }
+        var stop = tag.IndexOf(' ', value);
+        return (stop < 0 ? tag.Substring(value) : tag.Substring(value, stop - value)).Trim();
+    }
+
+    // Output-only projection: drops fields a decision never reads and keeps the few
+    // button facts an action needs. Delivery has already recorded this observation's
+    // tokens, so trimming the reply cannot weaken authorization.
+    private static readonly string[] DiagnosticFields =
+    {
+        "displayHash", "consistency", "source", "engineFamily", "projectionId", "buttonGeneration",
+        "rawTextLength", "textCharacterBudget", "window", "capturedUtc", "sessionId", "returnedLines",
+    };
+
+    private static Dictionary<string, object> CompactView(Dictionary<string, object> snapshot)
+    {
+        if (snapshot is null) return null;
+        var output = new Dictionary<string, object>(snapshot, StringComparer.Ordinal);
+        foreach (var field in DiagnosticFields) output.Remove(field);
+        if (output.TryGetValue("buttons", out var buttonsValue) && buttonsValue is List<object> buttons)
+            output["buttons"] = CompactButtons(buttons);
+        if (output.TryGetValue("input", out var inputValue) && inputValue is Dictionary<string, object> input)
+            output["input"] = CompactInput(input);
+        foreach (var nested in new[] { "observation", "current" })
+            if (output.TryGetValue(nested, out var value) && value is Dictionary<string, object> child)
+                output[nested] = CompactView(child);
+        return output;
+    }
+
+    private static List<object> CompactButtons(List<object> buttons)
+    {
+        var output = new List<object>(buttons.Count);
+        foreach (var entry in buttons)
+        {
+            if (entry is not Dictionary<string, object> button) { output.Add(entry); continue; }
+            var integer = Flag(button, "integer");
+            var slim = new Dictionary<string, object> { ["id"] = button.GetValueOrDefault("id"), ["label"] = CompactLabel(Convert.ToString(button.GetValueOrDefault("label"))) };
+            if (integer) slim["integer"] = true;
+            if (!Flag(button, "choosable")) slim["choosable"] = false;
+            if (!Flag(button, "active")) slim["active"] = false;
+            if (integer && button.GetValueOrDefault("value") is string value && value.Length > 0 && value.Length <= 12)
+                slim["value"] = value;
+            output.Add(slim);
+        }
+        return output;
+    }
+
+    private static string CompactLabel(string label)
+    {
+        if (string.IsNullOrEmpty(label) || label.Length < 3) return label;
+        var builder = new StringBuilder(label.Length);
+        var index = 0;
+        while (index < label.Length)
+        {
+            var c = label[index];
+            if (char.IsWhiteSpace(c))
+            {
+                while (index < label.Length && char.IsWhiteSpace(label[index])) index++;
+                builder.Append(' ');
+                continue;
+            }
+            builder.Append(c);
+            index++;
+        }
+        return builder.ToString();
+    }
+
+    private static Dictionary<string, object> CompactInput(Dictionary<string, object> input)
+    {
+        var output = new Dictionary<string, object> { ["kind"] = input.GetValueOrDefault("kind") };
+        if (Flag(input, "needValue")) output["needValue"] = true;
+        if (Flag(input, "timed")) output["timed"] = true;
+        if (Flag(input, "systemInput")) output["systemInput"] = true;
+        if (input.GetValueOrDefault("timeLimit") is long limit && limit > 0) output["timeLimit"] = limit;
+        if (input.TryGetValue("contractValid", out var valid) && valid is false) output["contractValid"] = false;
+        if (input.TryGetValue("missingMembers", out var missing)) output["missingMembers"] = missing;
+        return output;
+    }
+
+    private static bool CompactMode(JsonElement request) => GetString(request, "render") == "compact";
+
+    private static string Respond(JsonElement request, Dictionary<string, object> payload) =>
+        Json(CompactMode(request) ? CompactView(payload) : payload);
+
     private static Dictionary<string, object> OptionsFrom(JsonElement request)
     {
         var options = new Dictionary<string, object>
@@ -656,6 +915,12 @@ internal static class Bridge
         if (request.TryGetProperty("sinceCursor", out var sinceCursor) && sinceCursor.ValueKind == JsonValueKind.Number)
         {
             options["cursor"] = sinceCursor.GetInt64();
+        }
+        var render = GetString(request, "render");
+        if (render.Length > 0)
+        {
+            if (render != "full" && render != "compact") throw new ArgumentException("render must be full or compact");
+            options["compact"] = render == "compact";
         }
         var selectedMode = Convert.ToString(options["mode"]);
         if (selectedMode != "text" && selectedMode != "visual" && selectedMode != "both" && selectedMode != "auto")
@@ -722,22 +987,20 @@ internal static class Bridge
 
         var lines = new List<object>();
         var buttons = new List<object>();
-        var text = new StringBuilder();
         var displayed = new List<string>();
         var displayedIndex = new List<int>();
         var omittedInactive = 0;
         var omittedButtons = 0;
         var filteredNoise = 0;
         var collapsed = 0;
-        var characterBudget = 24000;
-        var textCut = false;
         var includeLines = options.ContainsKey("includeLines") && Convert.ToBoolean(options["includeLines"], CultureInfo.InvariantCulture);
         var filterNoise = !options.ContainsKey("noise") || !string.Equals(Convert.ToString(options["noise"]), "raw", StringComparison.OrdinalIgnoreCase);
+        var compactView = (options.ContainsKey("compact") && Convert.ToBoolean(options["compact"], CultureInfo.InvariantCulture)) ||
+            string.Equals(Convert.ToString(options.GetValueOrDefault("render"), CultureInfo.InvariantCulture), "compact", StringComparison.OrdinalIgnoreCase);
 
         for (var index = start; index < allLines.Count && index < start + limit; index++)
         {
             var line = allLines[index];
-            var lineNo = Convert.ToInt32(line?.GetType().GetField("LineNo", AnyInstance)?.GetValue(line) ?? index);
             var original = line?.ToString() ?? string.Empty;
             if (filterNoise && IsLoadNoise(original))
             {
@@ -748,28 +1011,45 @@ internal static class Bridge
             if (!string.Equals(display, original, StringComparison.Ordinal)) collapsed++;
             displayed.Add(display);
             displayedIndex.Add(index);
-            if (characterBudget > 0)
+        }
+
+        // Compaction runs before the text page and the delta so every projection agrees
+        // on the same line sequence, and the engine indices stay attached to each line.
+        var layoutLines = 0;
+        var mergedLines = 0;
+        var compressedRuns = 0;
+        if (compactView)
+        {
+            CompactDisplay(displayed, displayedIndex, out var compacted, out var compactedIndex,
+                out layoutLines, out mergedLines, out compressedRuns);
+            displayed = compacted;
+            displayedIndex = compactedIndex;
+        }
+
+        var text = new StringBuilder();
+        var characterBudget = 24000;
+        var textCut = false;
+        for (var ordinal = 0; ordinal < displayed.Count; ordinal++)
+        {
+            var display = displayed[ordinal];
+            if (characterBudget <= 0) { textCut = true; continue; }
+            var available = Math.Max(0, characterBudget - 2);
+            var clipped = display.Length > available ? display.Substring(0, available) : display;
+            var cut = clipped.Length < display.Length;
+            text.Append(clipped).Append("\r\n");
+            characterBudget -= clipped.Length + 2;
+            textCut |= cut;
+            if (includeLines)
             {
-                var available = Math.Max(0, characterBudget - 2);
-                var clipped = display.Length > available ? display.Substring(0, available) : display;
-                var cut = clipped.Length < display.Length;
-                text.Append(clipped).Append("\r\n");
-                characterBudget -= clipped.Length + 2;
-                textCut |= cut;
-                if (includeLines)
+                var line = allLines[displayedIndex[ordinal]];
+                var lineNo = Convert.ToInt32(line?.GetType().GetField("LineNo", AnyInstance)?.GetValue(line) ?? displayedIndex[ordinal]);
+                lines.Add(new Dictionary<string, object>
                 {
-                    lines.Add(new Dictionary<string, object>
-                    {
-                        ["index"] = index,
-                        ["lineNo"] = lineNo,
-                        ["text"] = clipped,
-                        ["truncated"] = cut,
-                    });
-                }
-            }
-            else
-            {
-                textCut = true;
+                    ["index"] = displayedIndex[ordinal],
+                    ["lineNo"] = lineNo,
+                    ["text"] = clipped,
+                    ["truncated"] = cut,
+                });
             }
         }
 
@@ -802,7 +1082,8 @@ internal static class Bridge
         var fingerprint = HashParts(SnapshotParts(frame, allLines));
         var projection = HashParts(new[] { mode, limit.ToString(CultureInfo.InvariantCulture),
             Convert.ToString(options.GetValueOrDefault("fromLine"), CultureInfo.InvariantCulture),
-            Convert.ToString(options.GetValueOrDefault("cursor"), CultureInfo.InvariantCulture), filterNoise.ToString() });
+            Convert.ToString(options.GetValueOrDefault("cursor"), CultureInfo.InvariantCulture), filterNoise.ToString(),
+            compactView.ToString() });
 
         var result = new Dictionary<string, object>
         {
@@ -833,6 +1114,9 @@ internal static class Bridge
             ["omittedButtons"] = omittedButtons,
             ["filteredNoiseLines"] = filteredNoise,
             ["collapsedSeparators"] = collapsed,
+            ["collapsedLayoutLines"] = layoutLines,
+            ["mergedRepeatedLines"] = mergedLines,
+            ["compressedRuns"] = compressedRuns,
             ["cursor"] = deletedLines + allLines.Count,
             ["nextCursor"] = deletedLines + Math.Min(allLines.Count, start + limit),
             ["cursorBase"] = deletedLines,
@@ -964,11 +1248,13 @@ internal static class Bridge
         var tail = displayed.Count - common;
         const int cap = 200;
         var tailCharacters = displayed.Skip(common).Sum(line => (long)line.Length + 2);
-        if (tail > cap || tailCharacters > 24000)
+        // A delta carries per-line JSON overhead, so it only wins while the reply is
+        // mostly old screen. Once the change covers most of the window the plain text
+        // is smaller, and that is what a caller has to read anyway.
+        if (tail > cap || tailCharacters > 24000 || tail * 5 >= displayed.Count * 3)
         {
-            // Too much to send as a delta; the full text is already in the result.
             delta["kind"] = "full";
-            delta["reason"] = "delta exceeds bounded line/character budget";
+            delta["reason"] = tail * 5 >= displayed.Count * 3 ? "delta covers most of the window" : "delta exceeds bounded line/character budget";
             result["delta"] = delta;
             return;
         }
