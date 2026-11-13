@@ -16,7 +16,11 @@ param(
  [string]$RuntimeDirectory,
  [ValidateSet('copy','inplace')][string]$RuntimeMode,
  [string]$ConfigPath,
- [switch]$Recreate
+ [switch]$Recreate,
+ # inplace builds run the real folder, so the first snapshot of its Sav is kept under
+ # the plugin state directory. `-RefreshSavBackup` forces a new one, `-NoSavBackup` skips.
+ [switch]$RefreshSavBackup,
+ [switch]$NoSavBackup
 )
 $ErrorActionPreference='Stop'
 [Console]::OutputEncoding=New-Object Text.UTF8Encoding($false)
@@ -34,6 +38,44 @@ $engineName=[IO.Path]::GetFileName($sourceEngine)
 $engine=if($mode -eq 'inplace') { $sourceEngine } else { Join-Path $runtime $engineName }
 $hostPath=Join-Path $runtime 'EraBridgeHost.exe'
 $markerPath=Join-Path $runtime '.erabridge-runtime.json'
+
+# An inplace session writes the game's own Sav, and a mistake there is unrecoverable:
+# a moved-aside directory that nobody restores, a cleanup between runs, a crash. Keep
+# one snapshot per distinct state of that folder outside the game, then reuse it, so
+# protection costs disk once instead of on every build.
+function Save-EraDshSavSnapshot {
+ param([string]$GameRoot,[switch]$Force,[switch]$Skip)
+ if($Skip) { return $null }
+ $sav=Join-Path $GameRoot 'Sav'
+ if(-not(Test-Path -LiteralPath $sav -PathType Container)) { return $null }
+ $files=@(Get-ChildItem -LiteralPath $sav -File -ErrorAction SilentlyContinue)
+ if($files.Count -eq 0) { return $null }
+ $bytes=($files | Measure-Object -Property Length -Sum).Sum
+ if($bytes -gt 2GB) { Write-Warning ('Sav snapshot skipped: ' + [math]::Round($bytes/1MB) + ' MB exceeds the 2 GB snapshot limit'); return $null }
+ $stateRoot=if($env:DSH_HOME){$env:DSH_HOME}else{Join-Path $env:USERPROFILE '.dsh'}
+ $leaf=Split-Path -Leaf $GameRoot
+ $seed=[Security.Cryptography.SHA256]::Create()
+ try { $digest=$seed.ComputeHash([Text.Encoding]::UTF8.GetBytes($GameRoot.ToLowerInvariant())) } finally { $seed.Dispose() }
+ $key=$leaf+'-'+([BitConverter]::ToString($digest,0,4).Replace('-','').ToLowerInvariant())
+ $dir=Join-Path (Join-Path (Join-Path $stateRoot 'era-bridge') 'sav-snapshots') $key
+ $markerPath=Join-Path $dir 'snapshot.json'
+ $latest=($files | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1).LastWriteTimeUtc.Ticks
+ $fingerprint=('{0}:{1}:{2}' -f $files.Count,$bytes,$latest)
+ if(-not $Force -and (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
+  try { $marker=Get-Content -LiteralPath $markerPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $marker=$null }
+  if($marker -and $marker.fingerprint -eq $fingerprint -and (Test-Path -LiteralPath (Join-Path $dir 'sav') -PathType Container)) {
+   return [pscustomobject]@{ path=(Join-Path $dir 'sav'); fileCount=$files.Count; bytes=$bytes; reused=$true; capturedUtc=$marker.capturedUtc }
+  }
+ }
+ [void](New-Item -ItemType Directory -Path $dir -Force)
+ $target=Join-Path $dir 'sav'
+ if(Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
+ [void](New-Item -ItemType Directory -Path $target)
+ foreach($file in $files) { Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $target $file.Name) -Force }
+ $captured=[DateTime]::UtcNow.ToString('o')
+ [ordered]@{ gameRoot=$GameRoot; fingerprint=$fingerprint; fileCount=$files.Count; bytes=$bytes; capturedUtc=$captured } | ConvertTo-Json | Set-Content -LiteralPath $markerPath -Encoding UTF8
+ [pscustomobject]@{ path=$target; fileCount=$files.Count; bytes=$bytes; reused=$false; capturedUtc=$captured }
+}
 
 if(@(Get-CimInstance Win32_Process | Where-Object {$_.ExecutablePath -eq $hostPath}).Count) { throw 'Bridge host is running; close it before rebuilding' }
 
@@ -89,6 +131,8 @@ if($settings.EngineKind -eq 'core') {
  $sessionId=[Guid]::NewGuid().ToString('N')
  $artifact=Join-Path $repositoryRoot ('artifacts\bridge-'+[DateTime]::UtcNow.ToString('yyyyMMddTHHmmss')+'-'+$sessionId.Substring(0,8))
  [void](New-Item -ItemType Directory -Path $artifact)
+ $savBackup=Save-EraDshSavSnapshot -GameRoot $settings.GameRoot -Force:$RefreshSavBackup -Skip:$NoSavBackup
+ if($savBackup) { Write-Output ('Sav snapshot: ' + $savBackup.path + ' (' + $savBackup.fileCount + ' files, ' + [math]::Round($savBackup.bytes/1MB,1) + ' MB, reused=' + $savBackup.reused.ToString().ToLowerInvariant() + ')') }
  $bytes=New-Object byte[] 32
  $rng=[Security.Cryptography.RandomNumberGenerator]::Create(); try { $rng.GetBytes($bytes) } finally {$rng.Dispose()}
  $settingsFile=[ordered]@{
@@ -107,6 +151,9 @@ if($settings.EngineKind -eq 'core') {
   runtimeDirectory=$runtime
   artifactDirectory=$artifact
   responseTimeoutSeconds=120
+  savBackupPath=if($savBackup){$savBackup.path}else{''}
+  savBackupFiles=if($savBackup){$savBackup.fileCount}else{0}
+  savBackupCapturedUtc=if($savBackup){$savBackup.capturedUtc}else{''}
  }
  $settingsPath=Join-Path $artifact 'session.json'
  $settingsFile | ConvertTo-Json | Set-Content -LiteralPath $settingsPath -Encoding UTF8
@@ -136,6 +183,10 @@ if($settings.EngineKind -eq 'core') {
   engineVerified=$false
   configPath=$settings.ConfigPath
   originalSavesCopied=$false
+  savBackupPath=if($savBackup){$savBackup.path}else{''}
+  savBackupFiles=if($savBackup){$savBackup.fileCount}else{0}
+  savBackupBytes=if($savBackup){$savBackup.bytes}else{0}
+  savBackupReused=if($savBackup){$savBackup.reused}else{$false}
  } | ConvertTo-Json
  return
 }
@@ -220,6 +271,9 @@ $config='<?xml version="1.0" encoding="utf-8"?><configuration><startup useLegacy
 $sessionId=[Guid]::NewGuid().ToString('N')
 $artifact=Join-Path $repositoryRoot ('artifacts\bridge-'+[DateTime]::UtcNow.ToString('yyyyMMddTHHmmss')+'-'+$sessionId.Substring(0,8))
 [void](New-Item -ItemType Directory -Path $artifact)
+# copy mode keeps the game's Sav untouched, so only an inplace build needs a snapshot.
+$savBackup=if($mode -eq 'inplace') { Save-EraDshSavSnapshot -GameRoot $settings.GameRoot -Force:$RefreshSavBackup -Skip:$NoSavBackup } else { $null }
+if($savBackup) { Write-Output ('Sav snapshot: ' + $savBackup.path + ' (' + $savBackup.fileCount + ' files, ' + [math]::Round($savBackup.bytes/1MB,1) + ' MB, reused=' + $savBackup.reused.ToString().ToLowerInvariant() + ')') }
 $bytes=New-Object byte[] 32
 $rng=[Security.Cryptography.RandomNumberGenerator]::Create(); try { $rng.GetBytes($bytes) } finally {$rng.Dispose()}
 $settingsFile=[ordered]@{
@@ -236,6 +290,9 @@ $settingsFile=[ordered]@{
  runtimeDirectory=$runtime
  artifactDirectory=$artifact
  hostPath=$hostPath
+ savBackupPath=if($savBackup){$savBackup.path}else{''}
+ savBackupFiles=if($savBackup){$savBackup.fileCount}else{0}
+ savBackupCapturedUtc=if($savBackup){$savBackup.capturedUtc}else{''}
 }
 $settingsPath=Join-Path $artifact 'session.json'
 $settingsFile | ConvertTo-Json | Set-Content -LiteralPath $settingsPath -Encoding UTF8
@@ -265,4 +322,8 @@ try {
  engineVerified=$settings.EngineVerified
  configPath=$settings.ConfigPath
  originalSavesCopied=$false
+ savBackupPath=if($savBackup){$savBackup.path}else{''}
+ savBackupFiles=if($savBackup){$savBackup.fileCount}else{0}
+ savBackupBytes=if($savBackup){$savBackup.bytes}else{0}
+ savBackupReused=if($savBackup){$savBackup.reused}else{$false}
 } | ConvertTo-Json

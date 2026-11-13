@@ -95,6 +95,8 @@ era_bridge({ action: "observe", sinceCursor: 120 })                             
 | 引擎 | `-EngineExecutable` → `ERADSH_ENGINE_EXE` → 配置项 → 目录内自动查找 |
 | 运行方式 | `-RuntimeMode` → `ERADSH_RUNTIME_MODE` → 配置项 → `inplace`（原地） / `copy`（隔离副本） |
 
+`inplace` 会写真实 `Sav`。因此 inplace 构建会给这个游戏的 `Sav` 留一份快照：内容没变就复用，变了才重新复制，位置在 `~/.dsh/era-bridge/sav-snapshots/<游戏名>-<路径哈希>/sav`（构建结果里的 `savBackupPath` / `savBackupFiles` / `savBackupReused` 就是它）。要强制重拍传 `-RefreshSavBackup`，要跳过传 `-NoSavBackup`。
+
 `erabridge.config.example.json` 是模板，复制成 `erabridge.config.json` 后填写；该文件已被 git 忽略。识别规则与支持范围见 [docs/engine-detection.md](docs/engine-detection.md)。
 
 > `inplace` 意味着桥接会话会写真实存档。做实验前先备份 `Sav/`，或显式切到 `-RuntimeMode copy`。
