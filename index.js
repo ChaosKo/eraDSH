@@ -28,6 +28,34 @@ const stateFile = join(stateRoot, 'last-session.json')
 const ACTIONS = ['build', 'open', 'status', 'observe', 'act', 'advance', 'close']
 const RUNTIME_MODES = ['inplace', 'copy']
 
+// Two skill bodies ship with the plugin so that a session does not have to know the
+// manual up front: the catalog entry costs one line, and the body is read only when
+// a model asks for it. `era-bridge` is the operating manual (the Era preset also
+// carries it inline for autonomous play); `era-dev` is the developer manual.
+const skillsRoot = resolve(here, 'skills')
+const SKILLS = [
+  {
+    name: 'era-bridge',
+    file: 'era-bridge.md',
+    description: '操作 Era / Emuera 游戏：通过 era_bridge 读取引擎正文与真实按钮、提交输入、自主推进剧情。用户提到 Era 游戏、era_bridge、读档存档或让 AI 自己玩时使用。',
+    whenToUse: '用户要玩、试玩、观察或让 AI 自主游玩一个 Era / Emuera 游戏实例时；也用于核对 era_bridge 的观察与动作规则。',
+  },
+  {
+    name: 'era-dev',
+    file: 'era-dev.md',
+    description: '开发与调试 eraDSH 插件本身：Host 入口、PowerShell 桥接客户端、.NET 启动钩子、回归测试与发布流程。要改这个仓库的代码、构建桥接或跑测试时使用。',
+    whenToUse: '用户要修改 eraDSH 的插件代码、PowerShell 脚本、桥接钩子，或构建、测试、发布这个仓库时。',
+  },
+]
+
+function readSkillBody(file) {
+  try {
+    return readFileSync(join(skillsRoot, file), 'utf8')
+  } catch {
+    return undefined
+  }
+}
+
 export function run({ powershell, script, args, timeoutMs = 30_000 }) {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(powershell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, ...args], {
@@ -206,4 +234,24 @@ export function apply(ctx, config = {}) {
       return parseSoleJson(stdout)
     },
   }))
+
+  // Both the tool and these skills are Host-scoped, so every preset that mounts
+  // skill tooling — `standard` included — can reach them. A profile without the
+  // skills service still gets era_bridge: the optional injection simply never runs.
+  ctx.inject(['skills'], skillCtx => {
+    for (const spec of SKILLS) {
+      const body = readSkillBody(spec.file)
+      if (body === undefined) {
+        ctx.logger?.warn?.(`dsh-era-bridge: skill body missing: ${join(skillsRoot, spec.file)}`)
+        continue
+      }
+      skillCtx.effect(() => skillCtx.skills.register({
+        name: spec.name,
+        description: spec.description,
+        whenToUse: spec.whenToUse,
+        source: 'bundled',
+        content: body,
+      }))
+    }
+  })
 }
